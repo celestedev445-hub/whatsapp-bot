@@ -455,7 +455,9 @@ class WhatsAppBot {
       console.log('🔄 Traitement du message de groupe...');
       // Sauvegarder le message seulement s'il provient du bon groupe
       await this.saveMessage(message);
-      await this.handleGroupMessage(message, contact, messageBody);
+      // Obtenir le contact de l'utilisateur qui a envoyé le message
+      const userContact = await this.client.getContactById(message.author);
+      await this.handleGroupMessage(message, userContact, messageBody);
     } else if (chat.isGroup) {
       console.log('⚠️ Message de groupe ignoré (mauvais ID)');
     } else {
@@ -512,10 +514,22 @@ class WhatsAppBot {
   async handlePrivateMessage(message, contact, messageBody) {
     const phoneNumber = contact.number;
     
-    // Commande spéciale pour lister les groupes
+    // Vérifier d'abord si la personne est membre du groupe
+    const isMember = await this.isGroupMember(contact);
+    if (!isMember) {
+      console.log(`🚫 Message privé ignoré - ${contact.name || contact.number} n'est pas membre du groupe`);
+      await message.reply('❌ Accès refusé. Vous devez être membre du groupe autorisé pour utiliser ce bot.');
+      return;
+    }
+    
+    // Commande spéciale pour lister les groupes (admin seulement)
     if (messageBody.includes('groupes') || messageBody.includes('liste-groupes')) {
-      await this.listAvailableGroups();
-      await message.reply('📋 Liste des groupes affichée dans la console du serveur');
+      if (contact.number === process.env.ADMIN_PHONE) {
+        await this.listAvailableGroups();
+        await message.reply('📋 Liste des groupes affichée dans la console du serveur');
+      } else {
+        await message.reply('❌ Cette commande est réservée à l\'administrateur');
+      }
       return;
     }
     
@@ -536,9 +550,6 @@ class WhatsAppBot {
 🔹 *Voir mon statut :*
 \`statut\` ou \`présence\`
 
-🔹 *Lister les groupes :*
-\`groupes\` ou \`liste-groupes\`
-
 📞 Pour toute question, contactez votre administrateur.`);
     }
   }
@@ -556,7 +567,7 @@ class WhatsAppBot {
       );
 
       if (existingAttendance.length > 0 && existingAttendance[0].arrival_time) {
-        await message.reply(`✅ Vous avez déjà marqué votre arrivée à ${existingAttendance[0].arrival_time}`);
+        await this.client.sendMessage(contact.id._serialized, `✅ Vous avez déjà marqué votre arrivée à ${existingAttendance[0].arrival_time}`);
         return;
       }
 
@@ -584,7 +595,7 @@ class WhatsAppBot {
       }
 
       const statusMessage = isLate ? '⚠️ Arrivée enregistrée (retard)' : '✅ Arrivée enregistrée';
-      await message.reply(`${statusMessage} - ${currentTime}`);
+      await this.client.sendMessage(contact.id._serialized, `${statusMessage} - ${currentTime}`);
 
       // Émettre un événement WebSocket pour l'arrivée
       if (global.io) {
@@ -602,7 +613,7 @@ class WhatsAppBot {
 
     } catch (error) {
       console.error('Erreur lors de l\'enregistrement de l\'arrivée:', error);
-      await message.reply('❌ Erreur lors de l\'enregistrement de votre arrivée');
+      await this.client.sendMessage(contact.id._serialized, '❌ Erreur lors de l\'enregistrement de votre arrivée');
     }
   }
 
@@ -619,12 +630,12 @@ class WhatsAppBot {
       );
 
       if (attendance.length === 0 || !attendance[0].arrival_time) {
-        await message.reply('❌ Vous devez d\'abord marquer votre arrivée');
+        await this.client.sendMessage(contact.id._serialized, '❌ Vous devez d\'abord marquer votre arrivée');
         return;
       }
 
       if (attendance[0].departure_time) {
-        await message.reply(`✅ Vous avez déjà marqué votre départ à ${attendance[0].departure_time}`);
+        await this.client.sendMessage(contact.id._serialized, `✅ Vous avez déjà marqué votre départ à ${attendance[0].departure_time}`);
         return;
       }
 
@@ -648,7 +659,7 @@ class WhatsAppBot {
         [currentTime, totalHours, employee.id, today]
       );
 
-      await message.reply(`✅ Départ enregistré - ${currentTime}\n📊 Heures travaillées: ${totalHours.toFixed(2)}h`);
+      await this.client.sendMessage(contact.id._serialized, `✅ Départ enregistré - ${currentTime}\n📊 Heures travaillées: ${totalHours.toFixed(2)}h`);
 
       // Émettre un événement WebSocket pour le départ
       if (global.io) {
@@ -665,7 +676,7 @@ class WhatsAppBot {
 
     } catch (error) {
       console.error('Erreur lors de l\'enregistrement du départ:', error);
-      await message.reply('❌ Erreur lors de l\'enregistrement de votre départ');
+      await this.client.sendMessage(contact.id._serialized, '❌ Erreur lors de l\'enregistrement de votre départ');
     }
   }
 
@@ -681,12 +692,12 @@ class WhatsAppBot {
       );
 
       if (attendance.length === 0) {
-        await message.reply('❌ Vous devez d\'abord marquer votre arrivée');
+        await this.client.sendMessage(contact.id._serialized, '❌ Vous devez d\'abord marquer votre arrivée');
         return;
       }
 
       if (attendance[0].lunch_start) {
-        await message.reply(`✅ Vous avez déjà marqué le début de votre pause à ${attendance[0].lunch_start}`);
+        await this.client.sendMessage(contact.id._serialized, `✅ Vous avez déjà marqué le début de votre pause à ${attendance[0].lunch_start}`);
         return;
       }
 
@@ -695,11 +706,11 @@ class WhatsAppBot {
         [currentTime, employee.id, today]
       );
 
-      await message.reply(`🍽️ Pause déjeuner commencée - ${currentTime}`);
+      await this.client.sendMessage(contact.id._serialized, `🍽️ Pause déjeuner commencée - ${currentTime}`);
 
     } catch (error) {
       console.error('Erreur lors de l\'enregistrement de la pause:', error);
-      await message.reply('❌ Erreur lors de l\'enregistrement de votre pause');
+      await this.client.sendMessage(contact.id._serialized, '❌ Erreur lors de l\'enregistrement de votre pause');
     }
   }
 
@@ -715,12 +726,12 @@ class WhatsAppBot {
       );
 
       if (attendance.length === 0 || !attendance[0].lunch_start) {
-        await message.reply('❌ Vous devez d\'abord marquer le début de votre pause');
+        await this.client.sendMessage(contact.id._serialized, '❌ Vous devez d\'abord marquer le début de votre pause');
         return;
       }
 
       if (attendance[0].lunch_end) {
-        await message.reply(`✅ Vous avez déjà marqué la fin de votre pause à ${attendance[0].lunch_end}`);
+        await this.client.sendMessage(contact.id._serialized, `✅ Vous avez déjà marqué la fin de votre pause à ${attendance[0].lunch_end}`);
         return;
       }
 
@@ -729,11 +740,11 @@ class WhatsAppBot {
         [currentTime, employee.id, today]
       );
 
-      await message.reply(`✅ Retour de pause - ${currentTime}`);
+      await this.client.sendMessage(contact.id._serialized, `✅ Retour de pause - ${currentTime}`);
 
     } catch (error) {
       console.error('Erreur lors de l\'enregistrement du retour de pause:', error);
-      await message.reply('❌ Erreur lors de l\'enregistrement de votre retour de pause');
+      await this.client.sendMessage(contact.id._serialized, '❌ Erreur lors de l\'enregistrement de votre retour de pause');
     }
   }
 
@@ -760,16 +771,23 @@ class WhatsAppBot {
         );
       }
 
-      await message.reply('📝 Absence enregistrée pour aujourd\'hui');
+      await this.client.sendMessage(contact.id._serialized, '📝 Absence enregistrée pour aujourd\'hui');
 
     } catch (error) {
       console.error('Erreur lors de l\'enregistrement de l\'absence:', error);
-      await message.reply('❌ Erreur lors de l\'enregistrement de votre absence');
+      await this.client.sendMessage(contact.id._serialized, '❌ Erreur lors de l\'enregistrement de votre absence');
     }
   }
 
   async handlePermissionRequest(message, contact) {
     try {
+      // Vérifier d'abord si la personne est membre du groupe
+      const isMember = await this.isGroupMember(contact);
+      if (!isMember) {
+        await message.reply('❌ Accès refusé. Vous devez être membre du groupe autorisé pour demander une permission.');
+        return;
+      }
+
       const employee = await this.getOrCreateEmployee(contact);
       
       // Analyser le message pour extraire les informations
@@ -824,12 +842,40 @@ class WhatsAppBot {
 
     } catch (error) {
       console.error('Erreur lors du traitement de la demande de permission:', error);
-      await message.reply('❌ Erreur lors du traitement de votre demande de permission');
+      if (error.message.includes('Personne non autorisée')) {
+        await message.reply('❌ Accès refusé. Vous devez être membre du groupe autorisé.');
+      } else {
+        await message.reply('❌ Erreur lors du traitement de votre demande de permission');
+      }
+    }
+  }
+
+  // Vérifier si un contact est membre du groupe configuré
+  async isGroupMember(contact) {
+    try {
+      if (!this.groupId) return false;
+      
+      // Vérifier dans la base de données si l'employé existe et est actif
+      const employee = await db.query(
+        'SELECT * FROM employees WHERE (whatsapp_id = ? OR phone = ?) AND is_active = 1 AND group_id = ?',
+        [contact.id._serialized, contact.number, this.groupId]
+      );
+      
+      return employee.length > 0;
+    } catch (error) {
+      console.error('Erreur lors de la vérification d\'appartenance au groupe:', error);
+      return false;
     }
   }
 
   async getOrCreateEmployee(contact) {
     try {
+      // Vérifier d'abord si la personne est membre du groupe
+      const isMember = await this.isGroupMember(contact);
+      if (!isMember) {
+        throw new Error('Personne non autorisée - pas membre du groupe');
+      }
+
       // Chercher l'employé existant
       let employee = await db.query(
         'SELECT * FROM employees WHERE whatsapp_id = ? OR phone = ?',
@@ -837,10 +883,10 @@ class WhatsAppBot {
       );
 
       if (employee.length === 0) {
-        // Créer un nouvel employé
+        // Créer un nouvel employé SEULEMENT s'il est membre du groupe
         const result = await db.query(
-          'INSERT INTO employees (whatsapp_id, name, phone) VALUES (?, ?, ?)',
-          [contact.id._serialized, contact.name || contact.pushname || 'Employé', contact.number]
+          'INSERT INTO employees (whatsapp_id, name, phone, group_id, is_active) VALUES (?, ?, ?, ?, 1)',
+          [contact.id._serialized, contact.name || contact.pushname || 'Employé', contact.number, this.groupId]
         );
         
         employee = await db.query('SELECT * FROM employees WHERE id = ?', [result.insertId]);
@@ -908,6 +954,13 @@ class WhatsAppBot {
 
   async sendAttendanceStatus(message, contact) {
     try {
+      // Vérifier d'abord si la personne est membre du groupe
+      const isMember = await this.isGroupMember(contact);
+      if (!isMember) {
+        await message.reply('❌ Accès refusé. Vous devez être membre du groupe autorisé pour consulter votre statut.');
+        return;
+      }
+
       const employee = await this.getOrCreateEmployee(contact);
       const today = moment().format('YYYY-MM-DD');
 
@@ -935,7 +988,11 @@ class WhatsAppBot {
 
     } catch (error) {
       console.error('Erreur lors de l\'envoi du statut:', error);
-      await message.reply('❌ Erreur lors de la récupération de votre statut');
+      if (error.message.includes('Personne non autorisée')) {
+        await message.reply('❌ Accès refusé. Vous devez être membre du groupe autorisé.');
+      } else {
+        await message.reply('❌ Erreur lors de la récupération de votre statut');
+      }
     }
   }
 

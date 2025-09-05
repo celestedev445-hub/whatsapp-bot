@@ -23,7 +23,8 @@ router.get('/', async (req, res) => {
         a.*,
         e.name as employee_name,
         e.position,
-        e.department
+        e.department,
+        e.phone
       FROM attendance a
       JOIN employees e ON a.employee_id = e.id
       WHERE e.group_id = ? AND e.is_active = 1
@@ -485,12 +486,26 @@ router.get('/recent', async (req, res) => {
   try {
     console.log('🔍 Récupération des présences récentes...');
     
-    // Requête très simple pour commencer
+    const groupId = process.env.WHATSAPP_GROUP_ID;
+    console.log('Group ID:', groupId);
+    
+    // Requête avec jointure pour récupérer les noms des employés
     const recentAttendance = await db.query(`
-      SELECT * FROM attendance ORDER BY created_at DESC LIMIT 10
-    `);
+      SELECT 
+        a.*,
+        e.name as employee_name,
+        e.position,
+        e.department,
+        e.phone
+      FROM attendance a
+      JOIN employees e ON a.employee_id = e.id
+      WHERE e.group_id = ? AND e.is_active = 1
+      ORDER BY a.created_at DESC 
+      LIMIT 10
+    `, [groupId]);
 
     console.log(`✅ ${recentAttendance.length} présences récentes trouvées`);
+    console.log('Données:', recentAttendance);
     res.json(recentAttendance);
   } catch (error) {
     console.error('Erreur lors de la récupération des présences récentes:', error);
