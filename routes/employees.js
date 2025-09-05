@@ -10,11 +10,14 @@ router.get('/', async (req, res) => {
     const employees = await db.query(`
       SELECT 
         e.*,
+        d.name as department_name,
+        d.id as department_id,
         COUNT(a.id) as total_attendance_days,
         COUNT(CASE WHEN a.status = 'present' THEN 1 END) as present_days,
         COUNT(CASE WHEN a.status = 'late' THEN 1 END) as late_days,
         COUNT(CASE WHEN a.status = 'absent' THEN 1 END) as absent_days
       FROM employees e
+      LEFT JOIN departments d ON e.department_id = d.id
       LEFT JOIN attendance a ON e.id = a.employee_id
       WHERE e.group_id = ? AND e.is_active = 1
       GROUP BY e.id
@@ -31,12 +34,48 @@ router.get('/', async (req, res) => {
   }
 });
 
+// GET /api/employees/all - Récupérer tous les employés (y compris inactifs)
+router.get('/all', async (req, res) => {
+  try {
+    const employees = await db.query(`
+      SELECT 
+        e.*,
+        d.name as department_name,
+        COUNT(a.id) as total_attendance_days,
+        COUNT(CASE WHEN a.status = 'present' THEN 1 END) as present_days,
+        COUNT(CASE WHEN a.status = 'late' THEN 1 END) as late_days,
+        COUNT(CASE WHEN a.status = 'absent' THEN 1 END) as absent_days
+      FROM employees e
+      LEFT JOIN departments d ON e.department_id = d.id
+      LEFT JOIN attendance a ON e.id = a.employee_id
+      GROUP BY e.id
+      ORDER BY e.name
+    `);
+
+    res.json(employees);
+  } catch (error) {
+    console.error('Erreur lors de la récupération de tous les employés:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Erreur lors de la récupération de tous les employés'
+    });
+  }
+});
+
 // GET /api/employees/:id - Récupérer un employé spécifique
 router.get('/:id', async (req, res) => {
   try {
     const { id } = req.params;
     
-    const employee = await db.query('SELECT * FROM employees WHERE id = ? AND is_active = 1', [id]);
+    const employee = await db.query(`
+      SELECT 
+        e.*,
+        d.name as department_name,
+        d.id as department_id
+      FROM employees e
+      LEFT JOIN departments d ON e.department_id = d.id
+      WHERE e.id = ? AND e.is_active = 1
+    `, [id]);
     
     if (employee.length === 0) {
       return res.status(404).json({
@@ -265,6 +304,107 @@ router.get('/:id/permissions', async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Erreur lors de la récupération des permissions'
+    });
+  }
+});
+
+// Assigner un employé à un département
+router.put('/:id/department', async (req, res) => {
+  try {
+    console.log('🔍 Assignation employé - ID:', req.params.id);
+    console.log('🔍 Body:', req.body);
+    
+    const { id } = req.params;
+    const { department_id, departmentId } = req.body;
+    const deptId = department_id || departmentId;
+    
+    console.log('🔍 Department ID:', deptId);
+    
+    if (!deptId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'L\'ID du département est requis' 
+      });
+    }
+    
+    // Vérifier que l'employé existe
+    const employees = await db.query(
+      'SELECT * FROM employees WHERE id = ?',
+      [id]
+    );
+    
+    if (employees.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Employé non trouvé' 
+      });
+    }
+    
+    // Vérifier que le département existe
+    const departments = await db.query(
+      'SELECT * FROM departments WHERE id = ?',
+      [deptId]
+    );
+    
+    if (departments.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Département non trouvé' 
+      });
+    }
+    
+    // Mettre à jour l'employé
+    await db.query(
+      'UPDATE employees SET department_id = ?, updated_at = NOW() WHERE id = ?',
+      [deptId, id]
+    );
+    
+    res.json({ 
+      success: true, 
+      message: 'Employé assigné au département avec succès' 
+    });
+  } catch (error) {
+    console.error('Erreur lors de l\'assignation de l\'employé:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Erreur lors de l\'assignation de l\'employé'
+    });
+  }
+});
+
+// Retirer un employé d'un département
+router.delete('/:id/department', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Vérifier que l'employé existe
+    const employees = await db.query(
+      'SELECT * FROM employees WHERE id = ?',
+      [id]
+    );
+    
+    if (employees.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Employé non trouvé' 
+      });
+    }
+    
+    // Retirer l'employé du département
+    await db.query(
+      'UPDATE employees SET department_id = NULL, updated_at = NOW() WHERE id = ?',
+      [id]
+    );
+    
+    res.json({ 
+      success: true, 
+      message: 'Employé retiré du département avec succès' 
+    });
+  } catch (error) {
+    console.error('Erreur lors du retrait de l\'employé:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Erreur lors du retrait de l\'employé'
     });
   }
 });

@@ -9,7 +9,7 @@ const whatsappBot = require('./services/whatsappBot');
 const cronJobs = require('./services/cronJobs');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = 3002; // Force le port 3002
 
 // Middleware de sécurité
 app.use(helmet());
@@ -26,12 +26,35 @@ app.use(limiter);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Middleware de débogage pour voir toutes les requêtes
+app.use((req, res, next) => {
+  console.log(`🌐 ${req.method} ${req.path} - ${new Date().toISOString()}`);
+  next();
+});
+
 // Routes
+console.log('🔧 Enregistrement des routes...');
 app.use('/api/employees', require('./routes/employees'));
+console.log('✅ Route /api/employees enregistrée');
 app.use('/api/attendance', require('./routes/attendance'));
+console.log('✅ Route /api/attendance enregistrée');
 app.use('/api/permissions', require('./routes/permissions'));
+console.log('✅ Route /api/permissions enregistrée');
 app.use('/api/reports', require('./routes/reports'));
+console.log('✅ Route /api/reports enregistrée');
 app.use('/api/admin', require('./routes/admin'));
+console.log('✅ Route /api/admin enregistrée');
+try {
+  console.log('📁 Chargement de la route departments...');
+  const departmentsRoute = require('./routes/departments');
+  app.use('/api/departments', departmentsRoute);
+  console.log('✅ Route /api/departments enregistrée');
+} catch (error) {
+  console.error('❌ Erreur lors du chargement de la route departments:', error.message);
+  console.error('Stack trace:', error.stack);
+}
+app.use('/api/messages', require('./routes/messages'));
+console.log('✅ Route /api/messages enregistrée');
 
 // Route de santé
 app.get('/health', (req, res) => {

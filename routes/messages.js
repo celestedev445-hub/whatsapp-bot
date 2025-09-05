@@ -28,10 +28,10 @@ router.get('/', async (req, res) => {
       LIMIT ${limitNum} OFFSET ${offset}
     `;
 
-    const [messages] = await db.query(query, [groupId]);
+    const messages = await db.query(query, [groupId]);
 
     // Compter le total des messages du groupe uniquement
-    const [countResult] = await db.query('SELECT COUNT(*) as total FROM messages WHERE group_id = ?', [groupId]);
+    const countResult = await db.query('SELECT COUNT(*) as total FROM messages WHERE group_id = ?', [groupId]);
     const total = countResult && countResult[0] ? countResult[0].total : 0;
 
     res.json({
@@ -72,7 +72,7 @@ router.get('/recent', async (req, res) => {
       LIMIT ${limitNum}
     `;
 
-    const [messages] = await db.query(query, [groupId]);
+    const messages = await db.query(query, [groupId]);
     res.json(messages);
   } catch (error) {
     console.error('Erreur lors de la récupération des messages récents:', error);
@@ -89,7 +89,7 @@ router.get('/stats', async (req, res) => {
     
     const groupId = process.env.WHATSAPP_GROUP_ID;
     
-    const [stats] = await db.query(`
+    const stats = await db.query(`
       SELECT 
         COUNT(*) as total_messages,
         COUNT(DISTINCT from_number) as unique_senders,
