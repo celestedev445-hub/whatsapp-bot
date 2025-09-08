@@ -20,9 +20,13 @@ router.get('/', async (req, res) => {
         m.*,
         e.name as employee_name,
         e.position,
-        e.department
+        d.name as department_name
       FROM messages m
-      LEFT JOIN employees e ON m.from_number = e.phone
+      LEFT JOIN employees e ON (
+        e.phone = SUBSTRING(m.from_number, 1, LOCATE('@', m.from_number) - 1) OR
+        e.phone = SUBSTRING(m.from_number, 2, LOCATE('@', m.from_number) - 2)
+      )
+      LEFT JOIN departments d ON e.department_id = d.id
       WHERE m.group_id = ?
       ORDER BY m.created_at DESC 
       LIMIT ${limitNum} OFFSET ${offset}
@@ -64,9 +68,14 @@ router.get('/recent', async (req, res) => {
       SELECT 
         m.*,
         e.name as employee_name,
-        e.position
+        e.position,
+        d.name as department_name
       FROM messages m
-      LEFT JOIN employees e ON m.from_number = e.phone
+      LEFT JOIN employees e ON (
+        e.phone = SUBSTRING(m.from_number, 1, LOCATE('@', m.from_number) - 1) OR
+        e.phone = SUBSTRING(m.from_number, 2, LOCATE('@', m.from_number) - 2)
+      )
+      LEFT JOIN departments d ON e.department_id = d.id
       WHERE m.group_id = ?
       ORDER BY m.created_at DESC 
       LIMIT ${limitNum}
@@ -104,6 +113,67 @@ router.get('/stats', async (req, res) => {
     console.error('Erreur lors de la récupération des statistiques des messages:', error);
     res.status(500).json({ 
       error: 'Erreur lors de la récupération des statistiques des messages',
+      details: error.message 
+    });
+  }
+});
+
+// POST /api/messages/send - Envoyer un message
+router.post('/send', async (req, res) => {
+  try {
+    const { content, message_type = 'text' } = req.body;
+    
+    if (!content || content.trim() === '') {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Le contenu du message est requis' 
+      });
+    }
+
+    const groupId = process.env.WHATSAPP_GROUP_ID;
+    
+    if (!groupId) {
+      return res.status(500).json({ 
+        success: false,
+        error: 'ID du groupe WhatsApp non configuré' 
+      });
+    }
+
+    // Insérer le message en base de données
+    const result = await db.query(`
+      INSERT INTO messages (group_id, from_number, content, message_type, created_at)
+      VALUES (?, ?, ?, ?, NOW())
+    `, [groupId, 'system', content.trim(), message_type]);
+
+    const messageId = result.insertId;
+
+    // Récupérer le message créé avec les informations de l'employé
+    const newMessage = await db.query(`
+      SELECT 
+        m.*,
+        e.name as employee_name,
+        e.position,
+        d.name as department_name
+      FROM messages m
+      LEFT JOIN employees e ON (
+        e.phone = SUBSTRING(m.from_number, 1, LOCATE('@', m.from_number) - 1) OR
+        e.phone = SUBSTRING(m.from_number, 2, LOCATE('@', m.from_number) - 2)
+      )
+      LEFT JOIN departments d ON e.department_id = d.id
+      WHERE m.id = ?
+    `, [messageId]);
+
+    res.json({
+      success: true,
+      message: 'Message envoyé avec succès',
+      data: newMessage[0]
+    });
+
+  } catch (error) {
+    console.error('Erreur lors de l\'envoi du message:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Erreur lors de l\'envoi du message',
       details: error.message 
     });
   }

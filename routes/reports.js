@@ -46,6 +46,7 @@ router.get('/', async (req, res) => {
     let baseQuery = `
       FROM attendance a
       JOIN employees e ON a.employee_id = e.id
+      LEFT JOIN departments d ON e.department_id = d.id
       WHERE a.date BETWEEN ? AND ? AND e.is_active = 1
     `;
     const params = [startDate, endDate];
@@ -56,7 +57,7 @@ router.get('/', async (req, res) => {
     }
 
     if (department) {
-      baseQuery += ' AND e.department = ?';
+      baseQuery += ' AND d.name = ?';
       params.push(department);
     }
 
@@ -65,7 +66,7 @@ router.get('/', async (req, res) => {
       SELECT 
         a.*,
         e.name as employee_name,
-        e.department,
+        d.name as department_name,
         e.position
       ${baseQuery}
       ORDER BY a.date DESC, e.name ASC
@@ -91,7 +92,7 @@ router.get('/', async (req, res) => {
       SELECT 
         e.id,
         e.name,
-        e.department,
+        d.name as department_name,
         e.position,
         COUNT(a.id) as total_days,
         COUNT(CASE WHEN a.status = 'present' THEN 1 END) as present_days,
@@ -102,14 +103,14 @@ router.get('/', async (req, res) => {
         SUM(a.total_work_hours) as total_work_hours,
         ROUND((COUNT(CASE WHEN a.status IN ('present', 'late') THEN 1 END) * 100.0 / COUNT(a.id)), 2) as attendance_rate
       ${baseQuery}
-      GROUP BY e.id, e.name, e.department, e.position
+      GROUP BY e.id, e.name, d.name, e.position
       ORDER BY attendance_rate DESC
     `, params);
 
     // Statistiques par département
     const departmentStats = await db.query(`
       SELECT 
-        e.department,
+        d.name as department_name,
         COUNT(DISTINCT e.id) as employee_count,
         COUNT(a.id) as total_days,
         COUNT(CASE WHEN a.status = 'present' THEN 1 END) as present_days,
@@ -118,7 +119,7 @@ router.get('/', async (req, res) => {
         AVG(a.total_work_hours) as avg_work_hours,
         ROUND((COUNT(CASE WHEN a.status IN ('present', 'late') THEN 1 END) * 100.0 / COUNT(a.id)), 2) as attendance_rate
       ${baseQuery}
-      GROUP BY e.department
+      GROUP BY d.name
       ORDER BY attendance_rate DESC
     `, params);
 
@@ -141,9 +142,10 @@ router.get('/', async (req, res) => {
       SELECT 
         p.*,
         e.name as employee_name,
-        e.department
+        d.name as department_name
       FROM permissions p
       JOIN employees e ON p.employee_id = e.id
+      LEFT JOIN departments d ON e.department_id = d.id
       WHERE p.start_date <= ? AND p.end_date >= ? AND e.is_active = 1
       ORDER BY p.start_date DESC
     `, [endDate, startDate]);
@@ -179,6 +181,191 @@ router.get('/', async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Erreur lors de la génération du rapport'
+    });
+  }
+});
+
+// POST /api/reports/generate - Générer un rapport personnalisé
+router.post('/generate', async (req, res) => {
+  try {
+    const { 
+      type = 'daily',
+      start_date, 
+      end_date, 
+      employee_id,
+      department,
+      format = 'json'
+    } = req.body;
+
+    let startDate, endDate;
+
+    // Définir les dates selon le type de rapport
+    switch (type) {
+      case 'daily':
+        startDate = endDate = moment().format('YYYY-MM-DD');
+        break;
+      case 'weekly':
+        startDate = moment().startOf('week').format('YYYY-MM-DD');
+        endDate = moment().endOf('week').format('YYYY-MM-DD');
+        break;
+      case 'monthly':
+        startDate = moment().startOf('month').format('YYYY-MM-DD');
+        endDate = moment().endOf('month').format('YYYY-MM-DD');
+        break;
+      case 'yearly':
+        startDate = moment().startOf('year').format('YYYY-MM-DD');
+        endDate = moment().endOf('year').format('YYYY-MM-DD');
+        break;
+      case 'custom':
+        startDate = start_date || moment().startOf('month').format('YYYY-MM-DD');
+        endDate = end_date || moment().endOf('month').format('YYYY-MM-DD');
+        break;
+      default:
+        startDate = endDate = moment().format('YYYY-MM-DD');
+    }
+
+    // Construire la requête de base
+    let baseQuery = `
+      FROM attendance a
+      JOIN employees e ON a.employee_id = e.id
+      LEFT JOIN departments d ON e.department_id = d.id
+      WHERE a.date BETWEEN ? AND ? AND e.is_active = 1
+    `;
+    const params = [startDate, endDate];
+
+    if (employee_id) {
+      baseQuery += ' AND a.employee_id = ?';
+      params.push(employee_id);
+    }
+
+    if (department) {
+      baseQuery += ' AND d.name = ?';
+      params.push(department);
+    }
+
+    // Récupérer les données de présence
+    const attendanceData = await db.query(`
+      SELECT 
+        a.*,
+        e.name as employee_name,
+        d.name as department_name,
+        e.position
+      ${baseQuery}
+      ORDER BY a.date DESC, e.name ASC
+    `, params);
+
+    // Statistiques générales
+    const generalStats = await db.query(`
+      SELECT 
+        COUNT(*) as total_records,
+        COUNT(DISTINCT a.employee_id) as unique_employees,
+        COUNT(CASE WHEN a.status = 'present' THEN 1 END) as present_count,
+        COUNT(CASE WHEN a.status = 'late' THEN 1 END) as late_count,
+        COUNT(CASE WHEN a.status = 'absent' THEN 1 END) as absent_count,
+        COUNT(CASE WHEN a.status = 'permission' THEN 1 END) as permission_count,
+        AVG(a.total_work_hours) as avg_work_hours,
+        SUM(a.total_work_hours) as total_work_hours
+      ${baseQuery}
+    `, params);
+
+    // Statistiques par employé
+    const employeeStats = await db.query(`
+      SELECT 
+        e.id,
+        e.name,
+        d.name as department_name,
+        e.position,
+        COUNT(a.id) as total_days,
+        COUNT(CASE WHEN a.status = 'present' THEN 1 END) as present_days,
+        COUNT(CASE WHEN a.status = 'late' THEN 1 END) as late_days,
+        COUNT(CASE WHEN a.status = 'absent' THEN 1 END) as absent_days,
+        COUNT(CASE WHEN a.status = 'permission' THEN 1 END) as permission_days,
+        AVG(a.total_work_hours) as avg_work_hours,
+        SUM(a.total_work_hours) as total_work_hours,
+        ROUND((COUNT(CASE WHEN a.status IN ('present', 'late') THEN 1 END) * 100.0 / COUNT(a.id)), 2) as attendance_rate
+      ${baseQuery}
+      GROUP BY e.id, e.name, d.name, e.position
+      ORDER BY attendance_rate DESC
+    `, params);
+
+    // Statistiques par département
+    const departmentStats = await db.query(`
+      SELECT 
+        d.name as department_name,
+        COUNT(DISTINCT e.id) as employee_count,
+        COUNT(a.id) as total_days,
+        COUNT(CASE WHEN a.status = 'present' THEN 1 END) as present_days,
+        COUNT(CASE WHEN a.status = 'late' THEN 1 END) as late_days,
+        COUNT(CASE WHEN a.status = 'absent' THEN 1 END) as absent_days,
+        AVG(a.total_work_hours) as avg_work_hours,
+        ROUND((COUNT(CASE WHEN a.status IN ('present', 'late') THEN 1 END) * 100.0 / COUNT(a.id)), 2) as attendance_rate
+      ${baseQuery}
+      GROUP BY d.name
+      ORDER BY attendance_rate DESC
+    `, params);
+
+    // Tendances quotidiennes
+    const dailyTrends = await db.query(`
+      SELECT 
+        a.date,
+        COUNT(*) as total_attendance,
+        COUNT(CASE WHEN a.status = 'present' THEN 1 END) as present_count,
+        COUNT(CASE WHEN a.status = 'late' THEN 1 END) as late_count,
+        COUNT(CASE WHEN a.status = 'absent' THEN 1 END) as absent_count,
+        AVG(a.total_work_hours) as avg_work_hours
+      ${baseQuery}
+      GROUP BY a.date
+      ORDER BY a.date DESC
+    `, params);
+
+    // Permissions dans la période
+    const permissionsInPeriod = await db.query(`
+      SELECT 
+        p.*,
+        e.name as employee_name,
+        d.name as department_name
+      FROM permissions p
+      JOIN employees e ON p.employee_id = e.id
+      LEFT JOIN departments d ON e.department_id = d.id
+      WHERE p.start_date <= ? AND p.end_date >= ? AND e.is_active = 1
+      ORDER BY p.start_date DESC
+    `, [endDate, startDate]);
+
+    const reportData = {
+      metadata: {
+        type,
+        period: { start_date: startDate, end_date: endDate },
+        generated_at: new Date().toISOString(),
+        filters: {
+          employee_id: employee_id || null,
+          department: department || null
+        }
+      },
+      summary: generalStats[0],
+      attendance_data: attendanceData,
+      employee_statistics: employeeStats,
+      department_statistics: departmentStats,
+      daily_trends: dailyTrends,
+      permissions: permissionsInPeriod
+    };
+
+    // Sauvegarder le rapport en base
+    await db.query(`
+      INSERT INTO reports (type, period_start, period_end, data, generated_at)
+      VALUES (?, ?, ?, ?, ?)
+    `, [type, startDate, endDate, JSON.stringify(reportData), new Date()]);
+
+    res.json({
+      success: true,
+      data: reportData
+    });
+
+  } catch (error) {
+    console.error('Erreur lors de la génération du rapport:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Erreur lors de la génération du rapport',
+      details: error.message
     });
   }
 });
@@ -220,7 +407,7 @@ router.get('/export', async (req, res) => {
       SELECT 
         a.date,
         e.name as employee_name,
-        e.department,
+        d.name as department_name,
         e.position,
         a.arrival_time,
         a.departure_time,
@@ -241,7 +428,7 @@ router.get('/export', async (req, res) => {
     }
 
     if (department) {
-      query += ' AND e.department = ?';
+      query += ' AND d.name = ?';
       params.push(department);
     }
 

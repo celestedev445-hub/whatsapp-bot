@@ -33,3 +33,4 @@ app.listen(PORT, () => {
   console.log(`Testez: http://localhost:${PORT}/api/departments`);
   console.log(`Test: http://localhost:${PORT}/test`);
 });
+
