@@ -44,6 +44,8 @@ app.use('/api/reports', require('./routes/reports'));
 console.log('✅ Route /api/reports enregistrée');
 app.use('/api/admin', require('./routes/admin'));
 console.log('✅ Route /api/admin enregistrée');
+app.use('/api/ai', require('./routes/ai'));
+console.log('✅ Route /api/ai enregistrée');
 try {
   console.log('📁 Chargement de la route departments...');
   const departmentsRoute = require('./routes/departments');
@@ -55,6 +57,8 @@ try {
 }
 app.use('/api/messages', require('./routes/messages'));
 console.log('✅ Route /api/messages enregistrée');
+app.use('/api/ai', require('./routes/ai'));
+console.log('✅ Route /api/ai enregistrée');
 
 // Route de santé
 app.get('/health', (req, res) => {

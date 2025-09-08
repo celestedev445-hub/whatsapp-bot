@@ -2,6 +2,8 @@ const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const db = require('../config/database');
 const moment = require('moment');
+const aiAgent = require('./aiAgent');
+const smartResponse = require('./smartResponse');
 
 class WhatsAppBot {
   constructor() {
@@ -428,8 +430,9 @@ class WhatsAppBot {
       }
 
       console.log('🧪 Envoi d\'un message de test...');
-      const chat = await this.client.getChatById(this.groupId);
-      await chat.sendMessage('🤖 Bot WhatsApp Entreprise - Prêt à fonctionner!\n\nEnvoyez "test" pour vérifier la connexion.');
+      
+      // Utiliser la nouvelle méthode d'envoi de message
+      await this.client.sendMessage(this.groupId, '🤖 Bienvenue dans le Bot WhatsApp Entreprise !\n\n💡 Utilisez "/" pour voir toutes mes fonctionnalités\n📅 Gestion de présence • 📋 Permissions • 🤖 IA conversationnelle\n\n✅ Bot prêt à vous assister !');
       console.log('✅ Message de test envoyé');
     } catch (error) {
       console.error('❌ Erreur lors de l\'envoi du message de test:', error);
@@ -450,6 +453,12 @@ class WhatsAppBot {
     console.log(`✅ Correspond au groupe: ${chat.id._serialized === this.groupId}`);
     console.log('---');
 
+    // 🚫 IGNORER LES MESSAGES DE SPAM/PUBLICITÉ
+    if (this.isSpamMessage(contact, message.body)) {
+      console.log('🚫 Message de spam ignoré');
+      return;
+    }
+
     // Vérifier si c'est un message de groupe
     if (chat.isGroup && chat.id._serialized === this.groupId) {
       console.log('🔄 Traitement du message de groupe...');
@@ -457,14 +466,666 @@ class WhatsAppBot {
       await this.saveMessage(message);
       // Obtenir le contact de l'utilisateur qui a envoyé le message
       const userContact = await this.client.getContactById(message.author);
-      await this.handleGroupMessage(message, userContact, messageBody);
+      
+      // 🤖 NOUVELLE FONCTIONNALITÉ : Analyse IA
+      await this.handleMessageWithAI(message, userContact, messageBody);
+      
     } else if (chat.isGroup) {
       console.log('⚠️ Message de groupe ignoré (mauvais ID)');
     } else {
       console.log('🔒 Traitement du message privé...');
-      // Message privé (pour les permissions) - ne pas sauvegarder les messages privés
+      // 🤖 NOUVELLE FONCTIONNALITÉ : Messages privés avec IA
+      await this.handlePrivateMessageWithAI(message, contact, messageBody);
+    }
+  }
+
+  /**
+   * 🚫 DÉTECTION DES MESSAGES DE SPAM/PUBLICITÉ
+   */
+  isSpamMessage(contact, messageBody) {
+    try {
+      const messageLower = messageBody.toLowerCase();
+      const contactName = (contact.name || '').toLowerCase();
+      const chatId = contact.id._serialized;
+      
+      // 🚫 CRITÈRES DE SPAM STRICTS
+      
+      // 1. Vérifier les IDs de chat suspects (newsletter, broadcast, etc.)
+      if (chatId.includes('@newsletter') || 
+          chatId.includes('@broadcast') || 
+          chatId.includes('@status') ||
+          chatId === 'status@broadcast') {
+        return true;
+      }
+      
+      // 2. Vérifier les noms de contact suspects (plus spécifiques)
+      const spamNames = [
+        'jobs', 'emploi', 'emplois', 'recrutement', 'newsletter', 'news', 
+        'bulletin', 'publicité', 'pub', 'marketing', 'promo', 'promotion', 
+        'vente', 'sécurité', 'paiement', 'facture', 'compte'
+      ];
+      
+      for (const spamName of spamNames) {
+        if (contactName.includes(spamName)) {
+          return true;
+        }
+      }
+      
+      // 3. Vérifier les patterns de spam spécifiques (plus précis)
+      const spamPatterns = [
+        // Liens de publicité avec mots-clés
+        /(cliquer|cliquez|clique).*https?:\/\/[^\s]+/i,
+        // Offres d'emploi avec liens
+        /(offre|offres|emploi|emplois|job|jobs|recrutement).*https?:\/\/[^\s]+/i,
+        // Messages de newsletter
+        /(newsletter|news|bulletin|abonnement|désabonnement|unsubscribe)/i,
+        // Publicité avec prix
+        /(prix|€|\$|cfa|franc).*https?:\/\/[^\s]+/i,
+        // Messages de service commercial
+        /(service client|support|aide|assistance|contact).*https?:\/\/[^\s]+/i
+      ];
+      
+      // Vérifier les patterns de spam
+      for (const pattern of spamPatterns) {
+        if (pattern.test(messageBody)) {
+          return true;
+        }
+      }
+      
+      // 4. Vérifier la longueur excessive (spam typique)
+      if (messageBody.length > 500) {
+        return true;
+      }
+      
+      // 5. Vérifier les messages avec beaucoup de caractères spéciaux
+      const specialCharCount = (messageBody.match(/[🔴🟢🟡🔵🟣🟠⚫⚪🟤]/g) || []).length;
+      if (specialCharCount > 5) {
+        return true;
+      }
+      
+      // 6. Vérifier les messages avec plusieurs liens (spam typique)
+      const linkCount = (messageBody.match(/https?:\/\/[^\s]+/g) || []).length;
+      if (linkCount > 2) {
+        return true;
+      }
+      
+      return false;
+      
+    } catch (error) {
+      console.error('Erreur lors de la détection de spam:', error);
+      return false;
+    }
+  }
+
+  /**
+   * 🆕 NOUVELLE FONCTIONNALITÉ : Gestion des suggestions de commandes avec "/"
+   */
+  async handleCommandSuggestions(message, contact, chat) {
+    try {
+      const messageText = message.body.trim();
+      
+      // Vérifier si le message commence par "/"
+      if (!messageText.startsWith('/')) {
+        return false;
+      }
+
+      const command = messageText.substring(1).toLowerCase();
+      const isPrivate = !chat.isGroup;
+      const isMember = await this.isGroupMember(contact);
+
+      // Si ce n'est pas un membre du groupe et c'est privé, refuser l'accès
+      if (isPrivate && !isMember) {
+        await this.sendAIMessage(contact.id._serialized, 
+          '❌ Accès refusé. Vous devez être membre du groupe autorisé pour utiliser ce bot.');
+        return true;
+      }
+
+      // Gérer les commandes de suggestions
+      if (command === '' || command === 'aide' || command === 'help') {
+        await this.sendCommandSuggestions(contact, isPrivate);
+        return true;
+      }
+
+      // Gérer les commandes spécifiques
+      if (command === 'presence' || command === 'présence') {
+        await this.sendPresenceCommands(contact, isPrivate);
+        return true;
+      }
+
+      if (command === 'permission' || command === 'permissions') {
+        await this.sendPermissionCommands(contact, isPrivate);
+        return true;
+      }
+
+      if (command === 'statut' || command === 'status') {
+        await this.sendAttendanceStatus(message, contact);
+        return true;
+      }
+
+      if (command === 'ia' || command === 'ai' || command === 'chat') {
+        await this.sendAIChatCommands(contact, isPrivate);
+        return true;
+      }
+
+      // Commandes d'admin - accessibles seulement aux admins du groupe WhatsApp
+      if (command.startsWith('admin') || 
+          command.startsWith('presences') || 
+          command.startsWith('présences') ||
+          command.startsWith('stats') || 
+          command.startsWith('statistiques') ||
+          command.startsWith('employés') || 
+          command.startsWith('employes') ||
+          command.startsWith('rapport') || 
+          command.startsWith('rapports')) {
+        
+        // Vérifier si l'utilisateur est admin du groupe WhatsApp
+        let isGroupAdmin = false;
+        
+        if (chat && chat.isGroup) {
+          // Pour les messages de groupe, vérifier le statut admin
+          isGroupAdmin = await this.isGroupAdmin(contact, chat);
+        } else {
+          // Pour les messages privés, vérifier si c'est un membre du groupe
+          // (nous considérons que tous les membres peuvent être des admins potentiels)
+          const isMember = await this.isGroupMember(contact);
+          isGroupAdmin = isMember;
+        }
+        
+        if (!isGroupAdmin) {
+          await this.sendAIMessage(contact.id._serialized, 
+            '❌ Accès refusé. Seuls les administrateurs du groupe peuvent utiliser ces commandes.');
+          return true;
+        }
+        
+        // Laisser passer ces commandes à l'IA pour traitement
+        return false;
+      }
+
+      // Commande non reconnue
+      await this.sendAIMessage(contact.id._serialized, 
+        `❓ Commande "/${command}" non reconnue.\n\nTapez "/aide" pour voir toutes les commandes disponibles.`);
+      return true;
+
+    } catch (error) {
+      console.error('Erreur lors du traitement des suggestions de commandes:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Envoie les suggestions de commandes principales
+   */
+  async sendCommandSuggestions(contact, isPrivate) {
+    const context = isPrivate ? 'privé' : 'groupe';
+    
+    let suggestions = `🤖 *Commandes disponibles (${context})*\n\n`;
+    
+    suggestions += `*📅 PRÉSENCE :*\n`;
+    suggestions += `• \`/presence\` → Voir les commandes de présence\n`;
+    suggestions += `• \`/statut\` → Voir mon statut du jour\n\n`;
+    
+    suggestions += `*📋 PERMISSIONS :*\n`;
+    suggestions += `• \`/permission\` → Voir les commandes de permissions\n\n`;
+    
+    suggestions += `*🤖 IA & CHAT :*\n`;
+    suggestions += `• \`/ia\` → Voir les commandes de conversation avec l'IA\n`;
+    suggestions += `• Parlez naturellement → L'IA vous répond intelligemment\n\n`;
+    
+    if (contact.number === process.env.ADMIN_PHONE) {
+      suggestions += `*⚙️ ADMIN :*\n`;
+      suggestions += `• \`/admin\` → Commandes administrateur\n\n`;
+    }
+    
+    suggestions += `*💡 ASTUCE :*\n`;
+    suggestions += `• Tapez "/" suivi d'une commande pour des suggestions\n`;
+    suggestions += `• Ou parlez naturellement, l'IA vous comprend !`;
+
+    await this.sendAIMessage(contact.id._serialized, suggestions);
+  }
+
+  /**
+   * Envoie les commandes de présence
+   */
+  async sendPresenceCommands(contact, isPrivate) {
+    let commands = `📅 *Commandes de présence*\n\n`;
+    
+    commands += `*✅ ARRIVÉE :*\n`;
+    commands += `• "Arrivée" ou "Bonjour" → Marquer l'arrivée\n`;
+    commands += `• "Je suis là" → Marquer l'arrivée\n\n`;
+    
+    commands += `*🚪 DÉPART :*\n`;
+    commands += `• "Départ" ou "Au revoir" → Marquer le départ\n`;
+    commands += `• "Je pars" → Marquer le départ\n\n`;
+    
+    commands += `*🍽️ PAUSE :*\n`;
+    commands += `• "Pause" ou "Déjeuner" → Commencer la pause\n`;
+    commands += `• "Retour de pause" → Finir la pause\n\n`;
+    
+    commands += `*❌ ABSENCE :*\n`;
+    commands += `• "Absent" ou "Malade" → Déclarer une absence\n\n`;
+    
+    commands += `*🚀 MISSIONS :*\n`;
+    commands += `• "Mission" ou "Sortie" → Sortie en mission\n`;
+    commands += `• "Retour de mission" → Retour de mission\n\n`;
+    
+    commands += `*🏠 TÉLÉTRAVAIL :*\n`;
+    commands += `• "Télétravail" ou "Remote" → Travail à distance\n\n`;
+    
+    commands += `*🏖️ CONGÉS :*\n`;
+    commands += `• "Congé" ou "Vacances" → Déclarer un congé\n\n`;
+    
+    commands += `*📊 STATUT :*\n`;
+    commands += `• \`/statut\` → Voir ma présence du jour`;
+
+    await this.sendAIMessage(contact.id._serialized, commands);
+  }
+
+  /**
+   * Envoie les commandes de permissions
+   */
+  async sendPermissionCommands(contact, isPrivate) {
+    let commands = `📋 *Commandes de permissions*\n\n`;
+    
+    commands += `*📝 DEMANDER UNE PERMISSION :*\n`;
+    commands += `• "Permission congé du 15/12/2023 au 20/12/2023 pour vacances"\n`;
+    commands += `• "Maladie du 10/12/2023 au 12/12/2023"\n`;
+    commands += `• "Permission médicale du 05/12/2023 au 06/12/2023"\n`;
+    commands += `• "Permission personnelle du 01/12/2023 au 02/12/2023"\n\n`;
+    
+    commands += `*📅 FORMAT DES DATES :*\n`;
+    commands += `• JJ/MM/AAAA (ex: 15/12/2023)\n`;
+    commands += `• JJ-MM-AAAA (ex: 15-12-2023)\n\n`;
+    
+    commands += `*📋 TYPES DE PERMISSIONS :*\n`;
+    commands += `• Congé / Vacances\n`;
+    commands += `• Maladie / Arrêt maladie\n`;
+    commands += `• Médical / Rendez-vous\n`;
+    commands += `• Personnel / Famille\n\n`;
+    
+    commands += `*💡 EXEMPLE COMPLET :*\n`;
+    commands += `"Permission congé du 15/12/2023 au 20/12/2023 pour vacances familiales"`;
+
+    await this.sendAIMessage(contact.id._serialized, commands);
+  }
+
+  /**
+   * Envoie les commandes de chat avec l'IA
+   */
+  async sendAIChatCommands(contact, isPrivate) {
+    let commands = `🤖 *Commandes de chat avec l'IA*\n\n`;
+    
+    commands += `*💬 CONVERSATIONS LIBRES :*\n`;
+    commands += `• Parlez naturellement → L'IA vous répond intelligemment\n`;
+    commands += `• "Comment ça va ?" → L'IA vous répond\n`;
+    commands += `• "Que penses-tu de..." → L'IA donne son avis\n\n`;
+    
+    commands += `*🏢 QUESTIONS D'ENTREPRISE :*\n`;
+    commands += `• "Comment gérer les retards ?"\n`;
+    commands += `• "Que faire si quelqu'un me parle mal ?"\n`;
+    commands += `• "Comment améliorer la communication ?"\n`;
+    commands += `• "Comment prendre une bonne décision ?"\n\n`;
+    
+    commands += `*🎯 MENTIONS DIRECTES :*\n`;
+    commands += `• "Mr bot, j'ai besoin de ton avis..."\n`;
+    commands += `• "Bot, que penses-tu de..."\n`;
+    commands += `• "IA, aide-moi avec..."\n\n`;
+    
+    commands += `*💡 ASTUCE :*\n`;
+    commands += `• L'IA comprend le contexte (groupe vs privé)\n`;
+    commands += `• Elle s'adapte à votre situation\n`;
+    commands += `• Elle peut vous conseiller sur le travail`;
+
+    await this.sendAIMessage(contact.id._serialized, commands);
+  }
+
+  /**
+   * Envoie les commandes administrateur
+   */
+  async sendAdminCommands(contact) {
+    let commands = `⚙️ *Commandes administrateur*\n\n`;
+    
+    commands += `*📊 RAPPORTS :*\n`;
+    commands += `• "rapport" → Générer un rapport de présence du jour\n\n`;
+    
+    commands += `*🔄 SYNCHRONISATION :*\n`;
+    commands += `• "/sync" → Synchroniser les membres du groupe\n`;
+    commands += `• "groupes" → Lister tous les groupes disponibles\n\n`;
+    
+    commands += `*📋 PERMISSIONS :*\n`;
+    commands += `• "APPROUVER [ID]" → Approuver une permission\n`;
+    commands += `• "REJETER [ID]" → Rejeter une permission\n\n`;
+    
+    commands += `*🔧 MAINTENANCE :*\n`;
+    commands += `• Le bot se synchronise automatiquement\n`;
+    commands += `• Les membres sont mis à jour en temps réel`;
+
+    await this.sendAIMessage(contact.id._serialized, commands);
+  }
+
+  /**
+   * Envoie une réponse quand l'IA ne recommande pas de traiter le message
+   */
+  async sendNoActionResponse(contact, message, isPrivate) {
+    try {
+      const messageLower = message.toLowerCase();
+      const context = isPrivate ? 'privé' : 'groupe';
+      
+      // Analyser le type de message pour donner une réponse appropriée
+      if (messageLower.includes('?')) {
+        // C'est une question
+        const responses = [
+          `🤔 Je ne peux pas répondre à cette question spécifique. Pour des questions sur le travail, tapez \`/ia\` pour voir comment discuter avec moi !`,
+          `❓ Cette question ne semble pas liée aux fonctionnalités du bot. Utilisez \`/aide\` pour voir ce que je peux faire pour vous.`,
+          `🤖 Je ne comprends pas cette question. Parlez-moi naturellement ou utilisez \`/ia\` pour discuter !`
+        ];
+        const response = responses[Math.floor(Math.random() * responses.length)];
+        await this.sendAIMessage(contact.id._serialized, response);
+        
+      } else if (messageLower.includes('bonjour') || messageLower.includes('salut') || messageLower.includes('hello')) {
+        // C'est une salutation
+        const responses = [
+          `👋 Salut ! Utilisez \`/aide\` pour voir ce que je peux faire pour vous.`,
+          `👋 Bonjour ! Tapez \`/\` pour voir toutes les commandes disponibles.`,
+          `👋 Hello ! Je suis là pour vous aider. Utilisez \`/presence\` pour marquer votre présence.`
+        ];
+        const response = responses[Math.floor(Math.random() * responses.length)];
+        await this.sendAIMessage(contact.id._serialized, response);
+        
+      } else if (messageLower.includes('merci') || messageLower.includes('thanks')) {
+        // C'est un remerciement
+        await this.sendAIMessage(contact.id._serialized, 
+          `😊 De rien ! N'hésitez pas à utiliser \`/aide\` si vous avez besoin d'aide.`);
+        
+      } else if (messageLower.includes('aide') || messageLower.includes('help')) {
+        // Demande d'aide
+        await this.sendCommandSuggestions(contact, isPrivate);
+        
+      } else {
+        // Message générique
+        const responses = [
+          `🤖 Je ne comprends pas ce message. Utilisez \`/aide\` pour voir ce que je peux faire pour vous.`,
+          `❓ Ce message ne semble pas correspondre à mes fonctionnalités. Tapez \`/\` pour voir les commandes disponibles.`,
+          `🤔 Je ne peux pas traiter ce message. Utilisez \`/ia\` pour discuter avec moi ou \`/presence\` pour marquer votre présence.`,
+          `💡 Je ne reconnais pas cette commande. Utilisez \`/aide\` pour voir toutes les possibilités.`
+        ];
+        const response = responses[Math.floor(Math.random() * responses.length)];
+        await this.sendAIMessage(contact.id._serialized, response);
+      }
+      
+    } catch (error) {
+      console.error('Erreur lors de l\'envoi de la réponse no-action:', error);
+      // Fallback simple
+      await this.sendAIMessage(contact.id._serialized, 
+        `🤖 Je ne comprends pas ce message. Utilisez \`/aide\` pour voir ce que je peux faire.`);
+    }
+  }
+
+  /**
+   * 🤖 NOUVELLE MÉTHODE : Traitement des messages avec IA
+   */
+  async handleMessageWithAI(message, contact, messageBody) {
+    try {
+      console.log('🤖 Démarrage de l\'analyse IA...');
+      
+      // Vérifier d'abord si c'est une commande avec "/"
+      const chat = await message.getChat();
+      const isCommandHandled = await this.handleCommandSuggestions(message, contact, chat);
+      if (isCommandHandled) {
+        console.log('✅ Commande "/" traitée');
+        return;
+      }
+      
+      // Analyser le message avec l'IA
+      const aiResult = await aiAgent.processMessage(message.body, contact, chat);
+      
+      console.log('📊 Résultat de l\'analyse IA:', {
+        type: aiResult.analysis.type,
+        confidence: aiResult.analysis.confidence,
+        action: aiResult.analysis.action,
+        shouldProcess: aiResult.shouldProcess
+      });
+
+      // Si l'IA recommande de traiter le message
+      if (aiResult.shouldProcess) {
+        console.log('✅ L\'IA recommande de traiter ce message');
+        
+        // Exécuter l'action recommandée
+        await this.executeAIAction(aiResult.analysis, message, contact);
+        
+        // Envoyer une réponse intelligente
+        if (aiResult.response) {
+          await this.sendAIMessage(contact.id._serialized, aiResult.response);
+        }
+      } else {
+        console.log('ℹ️ L\'IA ne recommande pas de traiter ce message');
+        
+        // Envoyer une réponse pour expliquer pourquoi le message n'est pas traité
+        await this.sendNoActionResponse(contact, message.body, false);
+      }
+
+    } catch (error) {
+      console.error('❌ Erreur lors du traitement IA:', error);
+      
+      // Fallback vers le traitement classique
+      console.log('🔄 Fallback vers le traitement classique...');
+      await this.handleGroupMessage(message, contact, messageBody);
+    }
+  }
+
+  /**
+   * 🤖 NOUVELLE MÉTHODE : Traitement des messages privés avec IA
+   */
+  async handlePrivateMessageWithAI(message, contact, messageBody) {
+    try {
+      console.log('🤖 Démarrage de l\'analyse IA pour message privé...');
+      
+      // Vérifier d'abord si la personne est membre du groupe
+      const isMember = await this.isGroupMember(contact);
+      if (!isMember) {
+        await this.sendAIMessage(contact.id._serialized, 
+          '❌ Accès refusé. Vous devez être membre du groupe autorisé pour utiliser ce bot.');
+        return;
+      }
+
+      // Vérifier d'abord si c'est une commande avec "/"
+      const chat = await message.getChat();
+      const isCommandHandled = await this.handleCommandSuggestions(message, contact, chat);
+      if (isCommandHandled) {
+        console.log('✅ Commande "/" traitée (privé)');
+        return;
+      }
+
+      // Analyser le message avec l'IA
+      const chatInfo = chat ? {
+        id: { _serialized: chat.id._serialized || contact.id._serialized },
+        isGroup: chat.isGroup || false
+      } : {
+        id: { _serialized: contact.id._serialized },
+        isGroup: false
+      };
+      
+      const aiResult = await aiAgent.processMessage(message.body, contact, chatInfo);
+      
+      console.log('📊 Résultat de l\'analyse IA (privé):', {
+        type: aiResult.analysis.type,
+        confidence: aiResult.analysis.confidence,
+        action: aiResult.analysis.action,
+        shouldProcess: aiResult.shouldProcess
+      });
+
+      // Si l'IA recommande de traiter le message
+      if (aiResult.shouldProcess) {
+        console.log('✅ L\'IA recommande de traiter ce message privé');
+        
+        // Exécuter l'action recommandée
+        await this.executeAIAction(aiResult.analysis, message, contact);
+        
+        // Envoyer une réponse intelligente
+        if (aiResult.response) {
+          await this.sendAIMessage(contact.id._serialized, aiResult.response);
+        }
+      } else {
+        console.log('ℹ️ L\'IA ne recommande pas de traiter ce message privé');
+        
+        // Envoyer une réponse pour expliquer pourquoi le message n'est pas traité
+        await this.sendNoActionResponse(contact, message.body, true);
+      }
+
+    } catch (error) {
+      console.error('❌ Erreur lors du traitement IA privé:', error);
+      
+      // Fallback vers le traitement classique
+      console.log('🔄 Fallback vers le traitement classique...');
       await this.handlePrivateMessage(message, contact, messageBody);
     }
+  }
+
+  /**
+   * Exécute l'action recommandée par l'IA
+   */
+  async executeAIAction(analysis, message, contact) {
+    try {
+      console.log(`🎯 Exécution de l'action IA: ${analysis.action}`);
+
+      switch (analysis.action) {
+        case 'arrival':
+        case 'departure':
+        case 'lunch_break':
+        case 'lunch_return':
+        case 'absence':
+        case 'mission':
+        case 'mission_return':
+        case 'remote_work':
+        case 'leave':
+          // L'IA gère tout, pas d'action spécifique du bot
+          break;
+        case 'create_permission':
+          await this.handleAIPermissionRequest(analysis, message, contact);
+          break;
+        case 'provide_help':
+          await this.sendHelpMessage(contact.id._serialized);
+          break;
+        case 'greet_back':
+          await this.sendGreetingMessage(contact.id._serialized);
+          break;
+        case 'status_check':
+          await this.sendAttendanceStatus(message, contact);
+          break;
+        case 'free_chat':
+          // Pas d'action spécifique, juste répondre
+          break;
+        case 'admin_command':
+          // Les commandes d'admin sont gérées par l'IA, pas d'action spécifique
+          // La réponse sera envoyée par l'IA
+          break;
+        default:
+          console.log('ℹ️ Aucune action spécifique à exécuter');
+      }
+
+    } catch (error) {
+      console.error('❌ Erreur lors de l\'exécution de l\'action IA:', error);
+    }
+  }
+
+  /**
+   * Gère les demandes de permission via IA
+   */
+  async handleAIPermissionRequest(analysis, message, contact) {
+    try {
+      const extractedInfo = analysis.extractedInfo;
+      
+      if (!extractedInfo.startDate || !extractedInfo.endDate) {
+        await this.sendAIMessage(contact.id._serialized, 
+          '📋 Demande reçue. Veuillez préciser les dates (ex: du 15/12/2023 au 20/12/2023).');
+        return;
+      }
+
+      // Vérifier si la personne est membre du groupe
+      const isMember = await this.isGroupMember(contact);
+      if (!isMember) {
+        await this.sendAIMessage(contact.id._serialized, 
+          '❌ Accès refusé. Vous devez être membre du groupe autorisé pour demander une permission.');
+        return;
+      }
+
+      const employee = await this.getOrCreateEmployee(contact);
+      
+      // Créer la demande de permission
+      await db.query(
+        'INSERT INTO permissions (employee_id, type, start_date, end_date, reason, status) VALUES (?, ?, ?, ?, ?, ?)',
+        [employee.id, extractedInfo.type, extractedInfo.startDate, extractedInfo.endDate, extractedInfo.reason, 'pending']
+      );
+
+      await this.sendAIMessage(contact.id._serialized, 
+        `📋 Demande de permission créée du ${extractedInfo.startDate} au ${extractedInfo.endDate}. En attente d'approbation.`);
+
+      // Notifier l'admin
+      await this.notifyAdminNewPermission(employee, extractedInfo.type, extractedInfo.startDate, extractedInfo.endDate, extractedInfo.reason);
+
+    } catch (error) {
+      console.error('Erreur lors du traitement de la demande de permission IA:', error);
+      await this.sendAIMessage(contact.id._serialized, 
+        '❌ Erreur lors du traitement de votre demande de permission');
+    }
+  }
+
+  /**
+   * Envoie un message via l'IA
+   */
+  async sendAIMessage(contactId, message) {
+    try {
+      // Utiliser la nouvelle API de whatsapp-web.js
+      await this.client.sendMessage(contactId, message);
+      console.log('🤖 Message IA envoyé:', message);
+    } catch (error) {
+      console.error('❌ Erreur lors de l\'envoi du message IA:', error);
+      // Fallback: essayer d'envoyer via le chat
+      try {
+        const chat = await this.client.getChatById(contactId);
+        await chat.sendMessage(message);
+        console.log('🤖 Message IA envoyé (fallback):', message);
+      } catch (fallbackError) {
+        console.error('❌ Erreur fallback lors de l\'envoi du message IA:', fallbackError);
+      }
+    }
+  }
+
+  /**
+   * Envoie un message d'aide
+   */
+  async sendHelpMessage(contactId) {
+    const helpMessage = `🤖 *Commandes disponibles :*
+
+*Présence :*
+• "Arrivée" ou "Bonjour" → Marquer l'arrivée
+• "Départ" ou "Au revoir" → Marquer le départ  
+• "Pause" → Commencer la pause déjeuner
+• "Retour de pause" → Finir la pause
+• "Absent" → Déclarer une absence
+
+*Permissions :*
+• "Permission congé du 15/12 au 20/12" → Demander un congé
+• "Maladie du 10/12 au 12/12" → Demander un arrêt maladie
+
+*Autres :*
+• "Statut" → Voir ma présence du jour
+• "Aide" → Afficher cette aide`;
+
+    await this.sendAIMessage(contactId, helpMessage);
+  }
+
+  /**
+   * Envoie un message de salutation
+   */
+  async sendGreetingMessage(contactId) {
+    const greetings = [
+      '👋 Bonjour ! Comment puis-je vous aider aujourd\'hui ?',
+      '👋 Salut ! Que puis-je faire pour vous ?',
+      '👋 Hello ! En quoi puis-je vous assister ?'
+    ];
+    
+    const randomGreeting = greetings[Math.floor(Math.random() * greetings.length)];
+    await this.sendAIMessage(contactId, randomGreeting);
   }
 
   async handleGroupMessage(message, contact, messageBody) {
@@ -567,7 +1228,7 @@ class WhatsAppBot {
       );
 
       if (existingAttendance.length > 0 && existingAttendance[0].arrival_time) {
-        await this.client.sendMessage(contact.id._serialized, `✅ Vous avez déjà marqué votre arrivée à ${existingAttendance[0].arrival_time}`);
+        await this.client.sendMessage(contact.id._serialized, `✅ Vous avez déjà marqué votre arrivée à ${existingAttendance[0].arrival_time}\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !`);
         return;
       }
 
@@ -595,7 +1256,8 @@ class WhatsAppBot {
       }
 
       const statusMessage = isLate ? '⚠️ Arrivée enregistrée (retard)' : '✅ Arrivée enregistrée';
-      await this.client.sendMessage(contact.id._serialized, `${statusMessage} - ${currentTime}`);
+      const fullMessage = `${statusMessage} à ${currentTime}\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !`;
+      await this.client.sendMessage(contact.id._serialized, fullMessage);
 
       // Émettre un événement WebSocket pour l'arrivée
       if (global.io) {
@@ -659,7 +1321,7 @@ class WhatsAppBot {
         [currentTime, totalHours, employee.id, today]
       );
 
-      await this.client.sendMessage(contact.id._serialized, `✅ Départ enregistré - ${currentTime}\n📊 Heures travaillées: ${totalHours.toFixed(2)}h`);
+      await this.client.sendMessage(contact.id._serialized, `✅ Départ enregistré à ${currentTime}\n📊 Heures travaillées: ${totalHours.toFixed(2)}h\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !`);
 
       // Émettre un événement WebSocket pour le départ
       if (global.io) {
@@ -706,7 +1368,7 @@ class WhatsAppBot {
         [currentTime, employee.id, today]
       );
 
-      await this.client.sendMessage(contact.id._serialized, `🍽️ Pause déjeuner commencée - ${currentTime}`);
+      await this.client.sendMessage(contact.id._serialized, `🍽️ Pause déjeuner commencée à ${currentTime}\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !`);
 
     } catch (error) {
       console.error('Erreur lors de l\'enregistrement de la pause:', error);
@@ -740,7 +1402,7 @@ class WhatsAppBot {
         [currentTime, employee.id, today]
       );
 
-      await this.client.sendMessage(contact.id._serialized, `✅ Retour de pause - ${currentTime}`);
+      await this.client.sendMessage(contact.id._serialized, `✅ Retour de pause à ${currentTime}\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !`);
 
     } catch (error) {
       console.error('Erreur lors de l\'enregistrement du retour de pause:', error);
@@ -771,11 +1433,141 @@ class WhatsAppBot {
         );
       }
 
-      await this.client.sendMessage(contact.id._serialized, '📝 Absence enregistrée pour aujourd\'hui');
+      await this.client.sendMessage(contact.id._serialized, '📝 Absence enregistrée pour aujourd\'hui\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !');
 
     } catch (error) {
       console.error('Erreur lors de l\'enregistrement de l\'absence:', error);
       await this.client.sendMessage(contact.id._serialized, '❌ Erreur lors de l\'enregistrement de votre absence');
+    }
+  }
+
+  async handleMission(message, contact) {
+    try {
+      const employee = await this.getOrCreateEmployee(contact);
+      const today = moment().format('YYYY-MM-DD');
+      const currentTime = moment().format('HH:mm:ss');
+
+      // Vérifier si l'employé a déjà une entrée pour aujourd'hui
+      const existingAttendance = await db.query(
+        'SELECT * FROM attendance WHERE employee_id = ? AND date = ?',
+        [employee.id, today]
+      );
+
+      if (existingAttendance.length > 0) {
+        await db.query(
+          'UPDATE attendance SET status = ?, notes = ? WHERE employee_id = ? AND date = ?',
+          ['on_mission', 'Sortie en mission', employee.id, today]
+        );
+      } else {
+        await db.query(
+          'INSERT INTO attendance (employee_id, date, status, notes) VALUES (?, ?, ?, ?)',
+          [employee.id, today, 'on_mission', 'Sortie en mission']
+        );
+      }
+
+      await this.client.sendMessage(contact.id._serialized, `🚀 Sortie en mission enregistrée à ${currentTime}\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !`);
+
+    } catch (error) {
+      console.error('Erreur lors de l\'enregistrement de la mission:', error);
+      await this.client.sendMessage(contact.id._serialized, '❌ Erreur lors de l\'enregistrement de votre sortie en mission');
+    }
+  }
+
+  async handleMissionReturn(message, contact) {
+    try {
+      const employee = await this.getOrCreateEmployee(contact);
+      const today = moment().format('YYYY-MM-DD');
+      const currentTime = moment().format('HH:mm:ss');
+
+      const attendance = await db.query(
+        'SELECT * FROM attendance WHERE employee_id = ? AND date = ?',
+        [employee.id, today]
+      );
+
+      if (attendance.length === 0) {
+        await this.client.sendMessage(contact.id._serialized, '❌ Aucune sortie en mission enregistrée pour aujourd\'hui');
+        return;
+      }
+
+      if (attendance[0].status !== 'on_mission') {
+        await this.client.sendMessage(contact.id._serialized, '❌ Vous n\'étiez pas en mission');
+        return;
+      }
+
+      await db.query(
+        'UPDATE attendance SET status = ?, notes = ? WHERE employee_id = ? AND date = ?',
+        ['present', 'Retour de mission', employee.id, today]
+      );
+
+      await this.client.sendMessage(contact.id._serialized, `✅ Retour de mission enregistré à ${currentTime}\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !`);
+
+    } catch (error) {
+      console.error('Erreur lors de l\'enregistrement du retour de mission:', error);
+      await this.client.sendMessage(contact.id._serialized, '❌ Erreur lors de l\'enregistrement de votre retour de mission');
+    }
+  }
+
+  async handleRemoteWork(message, contact) {
+    try {
+      const employee = await this.getOrCreateEmployee(contact);
+      const today = moment().format('YYYY-MM-DD');
+      const currentTime = moment().format('HH:mm:ss');
+
+      // Vérifier si l'employé a déjà une entrée pour aujourd'hui
+      const existingAttendance = await db.query(
+        'SELECT * FROM attendance WHERE employee_id = ? AND date = ?',
+        [employee.id, today]
+      );
+
+      if (existingAttendance.length > 0) {
+        await db.query(
+          'UPDATE attendance SET status = ?, notes = ? WHERE employee_id = ? AND date = ?',
+          ['remote', 'Télétravail', employee.id, today]
+        );
+      } else {
+        await db.query(
+          'INSERT INTO attendance (employee_id, date, status, notes) VALUES (?, ?, ?, ?)',
+          [employee.id, today, 'remote', 'Télétravail']
+        );
+      }
+
+      await this.client.sendMessage(contact.id._serialized, `🏠 Télétravail enregistré à ${currentTime}\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !`);
+
+    } catch (error) {
+      console.error('Erreur lors de l\'enregistrement du télétravail:', error);
+      await this.client.sendMessage(contact.id._serialized, '❌ Erreur lors de l\'enregistrement de votre télétravail');
+    }
+  }
+
+  async handleLeave(message, contact) {
+    try {
+      const employee = await this.getOrCreateEmployee(contact);
+      const today = moment().format('YYYY-MM-DD');
+      const currentTime = moment().format('HH:mm:ss');
+
+      // Vérifier si l'employé a déjà une entrée pour aujourd'hui
+      const existingAttendance = await db.query(
+        'SELECT * FROM attendance WHERE employee_id = ? AND date = ?',
+        [employee.id, today]
+      );
+
+      if (existingAttendance.length > 0) {
+        await db.query(
+          'UPDATE attendance SET status = ?, notes = ? WHERE employee_id = ? AND date = ?',
+          ['on_leave', 'Congé/Repos', employee.id, today]
+        );
+      } else {
+        await db.query(
+          'INSERT INTO attendance (employee_id, date, status, notes) VALUES (?, ?, ?, ?)',
+          [employee.id, today, 'on_leave', 'Congé/Repos']
+        );
+      }
+
+      await this.client.sendMessage(contact.id._serialized, `🏖️ Congé/Repos enregistré à ${currentTime}\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !`);
+
+    } catch (error) {
+      console.error('Erreur lors de l\'enregistrement du congé:', error);
+      await this.client.sendMessage(contact.id._serialized, '❌ Erreur lors de l\'enregistrement de votre congé');
     }
   }
 
@@ -864,6 +1656,44 @@ class WhatsAppBot {
       return employee.length > 0;
     } catch (error) {
       console.error('Erreur lors de la vérification d\'appartenance au groupe:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Vérifie si un contact est administrateur du groupe WhatsApp
+   */
+  async isGroupAdmin(contact, chat) {
+    try {
+      // Si ce n'est pas un groupe, refuser l'accès
+      if (!chat || !chat.isGroup) {
+        return false;
+      }
+
+      // Obtenir les participants du groupe avec la bonne méthode
+      const participants = await chat.participants;
+      
+      if (!participants || participants.length === 0) {
+        console.log('Aucun participant trouvé dans le groupe');
+        return false;
+      }
+      
+      // Chercher le contact dans les participants
+      const participant = participants.find(p => p.id._serialized === contact.id._serialized);
+      
+      if (!participant) {
+        console.log(`Contact ${contact.id._serialized} non trouvé dans les participants`);
+        return false;
+      }
+
+      // Vérifier si le participant est admin
+      const isAdmin = participant.isAdmin || participant.isSuperAdmin;
+      console.log(`Contact ${contact.name} - isAdmin: ${participant.isAdmin}, isSuperAdmin: ${participant.isSuperAdmin}, Résultat: ${isAdmin}`);
+      
+      return isAdmin;
+      
+    } catch (error) {
+      console.error('Erreur lors de la vérification admin du groupe:', error);
       return false;
     }
   }
