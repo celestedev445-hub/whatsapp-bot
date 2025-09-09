@@ -57,6 +57,7 @@ app.use('/api/reports', require('./routes/reports'));
 app.use('/api/departments', require('./routes/departments'));
 app.use('/api/messages', require('./routes/messages'));
 app.use('/api/ai', require('./routes/ai'));
+app.use('/api/employee-hours', require('./routes/employee-hours'));
 
 // Routes admin avec rate limiting spécial
 app.use('/api/admin', statusLimiter, require('./routes/admin'));
@@ -123,6 +124,7 @@ app.get('/', (req, res) => {
         departments: '/api/departments',
         messages: '/api/messages',
         ai: '/api/ai',
+        employeeHours: '/api/employee-hours',
         admin: '/api/admin'
       }
   });

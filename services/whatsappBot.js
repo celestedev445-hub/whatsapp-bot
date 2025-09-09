@@ -14,6 +14,8 @@ class WhatsAppBot {
 
   async initialize() {
     try {
+      // Passer l'instance du bot à l'agent IA
+      aiAgent.setWhatsAppBot(this);
 
       // Configuration du client WhatsApp
       this.client = new Client({
@@ -464,16 +466,40 @@ class WhatsAppBot {
       console.log('🔄 Traitement du message de groupe...');
       // Sauvegarder le message seulement s'il provient du bon groupe
       await this.saveMessage(message);
-      // Obtenir le contact de l'utilisateur qui a envoyé le message
-      const userContact = await this.client.getContactById(message.author);
       
-      // 🤖 NOUVELLE FONCTIONNALITÉ : Analyse IA
-      await this.handleMessageWithAI(message, userContact, messageBody);
+      // Vérifier si le bot est mentionné ou si c'est un message de présence
+      const isBotMentioned = aiAgent.isBotMentioned(messageBody);
+      
+      // Vérifier si c'est un message de présence (mots-clés)
+      const presenceKeywords = [
+        'arrivée', 'arrive', 'arrivé', 'présent', 'present',
+        'départ', 'depart', 'au revoir', 'à bientôt', 'à demain',
+        'pause', 'déjeuner', 'dejeuner', 'retour pause', 'retour de pause',
+        'absent', 'malade', 'maladie', 'congé', 'conge',
+        'je suis là', 'je suis la', 'je pars', 'je vais', 'je reviens',
+        'commencer', 'finir', 'terminer', 'quitter', 'partir'
+      ];
+      
+      const isPresenceMessage = presenceKeywords.some(keyword => 
+        messageBody.toLowerCase().includes(keyword)
+      );
+      
+      if (isBotMentioned || isPresenceMessage) {
+        console.log(`🤖 ${isBotMentioned ? 'Bot mentionné' : 'Message de présence'} - Traitement IA activé`);
+        // Obtenir le contact de l'utilisateur qui a envoyé le message
+        const userContact = await this.client.getContactById(message.author);
+        // 🤖 NOUVELLE FONCTIONNALITÉ : Analyse IA
+        await this.handleMessageWithAI(message, userContact, messageBody);
+      } else {
+        console.log('ℹ️ Bot non mentionné et pas de présence - Message ignoré dans le groupe');
+      }
       
     } else if (chat.isGroup) {
       console.log('⚠️ Message de groupe ignoré (mauvais ID)');
     } else {
       console.log('🔒 Traitement du message privé...');
+      // Sauvegarder le message privé
+      await this.savePrivateMessage(message);
       // 🤖 NOUVELLE FONCTIONNALITÉ : Messages privés avec IA
       await this.handlePrivateMessageWithAI(message, contact, messageBody);
     }
@@ -655,7 +681,7 @@ class WhatsAppBot {
   /**
    * Envoie les suggestions de commandes principales
    */
-  async sendCommandSuggestions(contact, isPrivate) {
+  async sendCommandSuggestions(contact, isPrivate, chat = null) {
     const context = isPrivate ? 'privé' : 'groupe';
     
     let suggestions = `🤖 *Commandes disponibles (${context})*\n\n`;
@@ -680,7 +706,8 @@ class WhatsAppBot {
     suggestions += `• Tapez "/" suivi d'une commande pour des suggestions\n`;
     suggestions += `• Ou parlez naturellement, l'IA vous comprend !`;
 
-    await this.sendAIMessage(contact.id._serialized, suggestions);
+    const targetId = (chat && chat.isGroup) ? chat.id._serialized : contact.id._serialized;
+    await this.sendAIMessage(targetId, suggestions);
   }
 
   /**
@@ -805,10 +832,13 @@ class WhatsAppBot {
   /**
    * Envoie une réponse quand l'IA ne recommande pas de traiter le message
    */
-  async sendNoActionResponse(contact, message, isPrivate) {
+  async sendNoActionResponse(contact, message, isPrivate, chat = null) {
     try {
       const messageLower = message.toLowerCase();
       const context = isPrivate ? 'privé' : 'groupe';
+      
+      // Déterminer l'ID cible : groupe ou privé
+      const targetId = (chat && chat.isGroup) ? chat.id._serialized : contact.id._serialized;
       
       // Analyser le type de message pour donner une réponse appropriée
       if (messageLower.includes('?')) {
@@ -819,7 +849,7 @@ class WhatsAppBot {
           `🤖 Je ne comprends pas cette question. Parlez-moi naturellement ou utilisez \`/ia\` pour discuter !`
         ];
         const response = responses[Math.floor(Math.random() * responses.length)];
-        await this.sendAIMessage(contact.id._serialized, response);
+        await this.sendAIMessage(targetId, response);
         
       } else if (messageLower.includes('bonjour') || messageLower.includes('salut') || messageLower.includes('hello')) {
         // C'est une salutation
@@ -829,16 +859,16 @@ class WhatsAppBot {
           `👋 Hello ! Je suis là pour vous aider. Utilisez \`/presence\` pour marquer votre présence.`
         ];
         const response = responses[Math.floor(Math.random() * responses.length)];
-        await this.sendAIMessage(contact.id._serialized, response);
+        await this.sendAIMessage(targetId, response);
         
       } else if (messageLower.includes('merci') || messageLower.includes('thanks')) {
         // C'est un remerciement
-        await this.sendAIMessage(contact.id._serialized, 
+        await this.sendAIMessage(targetId, 
           `😊 De rien ! N'hésitez pas à utiliser \`/aide\` si vous avez besoin d'aide.`);
         
       } else if (messageLower.includes('aide') || messageLower.includes('help')) {
         // Demande d'aide
-        await this.sendCommandSuggestions(contact, isPrivate);
+        await this.sendCommandSuggestions(contact, isPrivate, chat);
         
       } else {
         // Message générique
@@ -849,7 +879,7 @@ class WhatsAppBot {
           `💡 Je ne reconnais pas cette commande. Utilisez \`/aide\` pour voir toutes les possibilités.`
         ];
         const response = responses[Math.floor(Math.random() * responses.length)];
-        await this.sendAIMessage(contact.id._serialized, response);
+        await this.sendAIMessage(targetId, response);
       }
       
     } catch (error) {
@@ -892,15 +922,50 @@ class WhatsAppBot {
         // Exécuter l'action recommandée
         await this.executeAIAction(aiResult.analysis, message, contact);
         
+        // Émettre un événement WebSocket pour les actions de présence
+        if (aiResult.analysis.action && ['arrival', 'departure', 'lunch_break', 'lunch_return', 'absence', 'mission', 'mission_return', 'remote_work', 'leave'].includes(aiResult.analysis.action)) {
+          if (global.io) {
+            console.log(`🚀 ÉMISSION WEBSOCKET - Envoi de l'événement attendance_update pour ${aiResult.analysis.action}`);
+            global.io.emit('attendance_update', {
+              type: aiResult.analysis.action,
+              employee_name: contact.name || contact.pushname || 'Employé',
+              timestamp: new Date().toISOString(),
+              message_content: message.body
+            });
+            console.log(`📡 Événement WebSocket "attendance_update" émis pour ${aiResult.analysis.action}`);
+          } else {
+            console.log(`❌ global.io n'est pas disponible pour émettre l'événement attendance_update`);
+          }
+        }
+        
         // Envoyer une réponse intelligente
         if (aiResult.response) {
-          await this.sendAIMessage(contact.id._serialized, aiResult.response);
+          const chat = await message.getChat();
+          
+          // Déterminer où envoyer la réponse selon le type d'action
+          if (chat.isGroup) {
+            // Dans un groupe : présences en privé, mentions dans le groupe
+            if (aiResult.analysis.action === 'free_chat' || aiResult.analysis.type === 'mention') {
+              // Mention du bot : répondre dans le groupe
+              await this.sendAIMessage(chat.id._serialized, aiResult.response);
+            } else {
+              // Présences : répondre en privé
+              await this.sendAIMessage(contact.id._serialized, aiResult.response);
+            }
+          } else {
+            // Message privé : toujours en privé
+            await this.sendAIMessage(contact.id._serialized, aiResult.response);
+          }
         }
       } else {
         console.log('ℹ️ L\'IA ne recommande pas de traiter ce message');
         
-        // Envoyer une réponse pour expliquer pourquoi le message n'est pas traité
-        await this.sendNoActionResponse(contact, message.body, false);
+        // Ne pas envoyer de réponse pour les messages de groupe non traités
+        // Seulement pour les messages privés
+        const chat = await message.getChat();
+        if (!chat.isGroup) {
+          await this.sendNoActionResponse(contact, message.body, true, chat);
+        }
       }
 
     } catch (error) {
@@ -1077,6 +1142,18 @@ class WhatsAppBot {
       // Utiliser la nouvelle API de whatsapp-web.js
       await this.client.sendMessage(contactId, message);
       console.log('🤖 Message IA envoyé:', message);
+      
+      // Sauvegarder le message envoyé par l'IA dans la base de données
+      try {
+        await db.query(
+          'INSERT INTO messages (message_id, from_number, group_id, content, message_type, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+          [`ai_${Date.now()}`, 'BOT', contactId, message, 'ai_response', new Date()]
+        );
+        console.log('💾 Message IA sauvegardé en base de données');
+      } catch (saveError) {
+        console.error('❌ Erreur lors de la sauvegarde du message IA:', saveError);
+      }
+      
     } catch (error) {
       console.error('❌ Erreur lors de l\'envoi du message IA:', error);
       // Fallback: essayer d'envoyer via le chat
@@ -1084,6 +1161,18 @@ class WhatsAppBot {
         const chat = await this.client.getChatById(contactId);
         await chat.sendMessage(message);
         console.log('🤖 Message IA envoyé (fallback):', message);
+        
+        // Sauvegarder aussi le message fallback
+        try {
+          await db.query(
+            'INSERT INTO messages (message_id, from_number, group_id, content, message_type, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+            [`ai_${Date.now()}`, 'BOT', contactId, message, 'ai_response', new Date()]
+          );
+          console.log('💾 Message IA (fallback) sauvegardé en base de données');
+        } catch (saveError) {
+          console.error('❌ Erreur lors de la sauvegarde du message IA (fallback):', saveError);
+        }
+        
       } catch (fallbackError) {
         console.error('❌ Erreur fallback lors de l\'envoi du message IA:', fallbackError);
       }
@@ -1749,6 +1838,37 @@ class WhatsAppBot {
       }
     } catch (error) {
       console.error('Erreur lors de la sauvegarde du message:', error);
+    }
+  }
+
+  async savePrivateMessage(message) {
+    try {
+      // Pour les messages privés, utiliser l'ID du contact comme group_id
+      const contact = await message.getContact();
+      const chatId = contact.id._serialized;
+      
+      await db.query(
+        'INSERT INTO messages (message_id, from_number, group_id, content, message_type, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        [message.id._serialized, message.from, chatId, message.body, 'text', new Date()]
+      );
+      
+      console.log(`💾 Message privé sauvegardé: ${contact.name || contact.number}`);
+      
+      // Émettre un événement WebSocket pour notifier les clients
+      if (global.io) {
+        global.io.emit('new_message', {
+          message_id: message.id._serialized,
+          from_number: message.from,
+          content: message.body,
+          message_type: 'text',
+          timestamp: new Date(),
+          is_private: true
+        });
+        console.log('📡 Événement WebSocket "new_message" émis (privé)');
+      }
+      
+    } catch (error) {
+      console.error('Erreur lors de la sauvegarde du message privé:', error);
     }
   }
 

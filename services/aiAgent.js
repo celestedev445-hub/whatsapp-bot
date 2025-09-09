@@ -1,4 +1,5 @@
 const { HfInference } = require('@huggingface/inference');
+const { CohereClient, CohereClientV2 } = require('cohere-ai');
 const db = require('../config/database');
 const moment = require('moment');
 const axios = require('axios');
@@ -6,16 +7,23 @@ const axios = require('axios');
 class AIAgent {
   constructor() {
     this.hf = new HfInference(process.env.HUGGINGFACE_API_KEY || 'hf_demo');
+    this.cohere = new CohereClient({
+      token: process.env.COHERE_API_KEY || 'demo_key'
+    });
+    this.cohereV2 = new CohereClientV2({
+      token: process.env.COHERE_API_KEY || 'demo_key'
+    });
     this.isEnabled = process.env.AI_AGENT_ENABLED !== 'false'; // Activé par défaut
     this.confidenceThreshold = 0.3; // Seuil plus bas pour les tests
+    this.whatsappBot = null; // Instance du bot WhatsApp
     
     // Configuration pour l'IA conversationnelle
     this.conversationalAI = {
-      enabled: false, // Désactivé par défaut, utilise l'IA intelligente locale
-      provider: 'local', // Utilise notre IA intelligente locale
-      model: 'intelligent-local',
-      maxLength: 150,
-      temperature: 0.7
+      enabled: true, // Activé avec Cohere
+      provider: 'cohere', // Toujours utiliser Cohere
+      model: 'command', // Modèle Cohere
+      maxLength: parseInt(process.env.AI_MAX_LENGTH) || 80, // Réponses plus courtes
+      temperature: parseFloat(process.env.AI_TEMPERATURE) || 0.3 // Plus déterministe
     };
     
     // Modèles pour différentes tâches
@@ -24,6 +32,13 @@ class AIAgent {
       sentiment: 'cardiffnlp/twitter-roberta-base-sentiment-latest',
       ner: 'dbmdz/bert-large-cased-finetuned-conll03-english'
     };
+  }
+
+  /**
+   * Définit l'instance du bot WhatsApp
+   */
+  setWhatsAppBot(bot) {
+    this.whatsappBot = bot;
   }
 
   /**
@@ -73,6 +88,33 @@ class AIAgent {
         error: error.message 
       };
     }
+  }
+
+  /**
+   * Vérifie si le message contient une mention explicite du bot
+   */
+  isBotMentioned(message) {
+    const messageLower = message.toLowerCase();
+    
+    // Vérifier les mentions @numéro (format WhatsApp)
+    const mentionRegex = /@(\d+)/g;
+    const mentions = message.match(mentionRegex);
+    
+    if (mentions) {
+      // Vérifier si l'un des numéros mentionnés correspond au bot
+      // Le numéro du bot devrait être dans les variables d'environnement
+      const botPhone = process.env.BOT_PHONE || process.env.ADMIN_PHONE;
+      if (botPhone) {
+        return mentions.some(mention => mention.includes(botPhone));
+      }
+    }
+    
+    // Vérifier les mentions textuelles du bot
+    const botMentions = [
+      'mr le manager', '@bot',
+    ];
+    
+    return botMentions.some(mention => messageLower.includes(mention));
   }
 
   /**
@@ -186,17 +228,28 @@ class AIAgent {
       }
       
       // Vérifier si c'est une mention directe du bot
-      const isDirectMention = messageLower.includes('mr bot') || 
-                             messageLower.includes('mister bot') ||
-                             messageLower.includes('@bot') ||
-                             messageLower.includes('hey bot') ||
-                             messageLower.includes('salut bot') ||
-                             messageLower.includes('bonjour bot') ||
-                             messageLower.includes('bot,') ||
-                             messageLower.includes('bot !');
+      const isDirectMention = this.isBotMentioned(message);
       
       if (isDirectMention && bestMatch.confidence < 0.5) {
         bestMatch = { type: 'mention', confidence: 0.8 };
+      }
+      
+      // Dans les groupes, ignorer les messages qui ne mentionnent pas le bot
+      if (context && context.isGroup && !isDirectMention) {
+        // Vérifier si c'est une fonction importante (présence, permissions, admin)
+        const isImportantFunction = bestMatch.type === 'attendance' || 
+                                   bestMatch.type === 'permission' || 
+                                   bestMatch.type === 'admin_command';
+        
+        if (!isImportantFunction) {
+          // Ignorer les conversations normales dans les groupes
+          bestMatch = { type: 'other', confidence: 0 };
+        }
+      } else if (context && context.isGroup && isDirectMention) {
+        // Si le bot est mentionné dans un groupe, traiter comme une conversation libre
+        if (bestMatch.type === 'mention') {
+          bestMatch = { type: 'free_chat', confidence: 0.8 };
+        }
       }
       
       // Pour les conversations privées, traiter tous les messages comme des conversations libres
@@ -217,7 +270,10 @@ class AIAgent {
       }
 
       console.log(`🔍 Classification: "${message}" → ${bestMatch.type} (${bestMatch.confidence})`);
-      return bestMatch;
+      return {
+        ...bestMatch,
+        originalMessage: message
+      };
 
     } catch (error) {
       console.error('Erreur lors de la classification:', error);
@@ -378,6 +434,9 @@ class AIAgent {
     // Seuil spécial pour les messages de présence (plus permissif)
     const isAttendance = classification.type === 'attendance';
     
+    // Vérifier si le bot est mentionné dans le message
+    const isBotMentioned = this.isBotMentioned(classification.originalMessage || '');
+    
     let effectiveThreshold;
     if (isFreeChat) {
       effectiveThreshold = 0.1;
@@ -392,8 +451,33 @@ class AIAgent {
       effectiveThreshold = this.confidenceThreshold;
     }
     
-    if (classification.confidence < effectiveThreshold) {
-      return 'none';
+    // Dans les groupes, être très strict si le bot n'est pas mentionné
+    if (context && context.isGroup && !isBotMentioned) {
+      // Seulement les fonctions importantes (présence, permissions, admin) sans mention
+      const isImportantFunction = classification.type === 'attendance' || 
+                                 classification.type === 'permission' || 
+                                 classification.type === 'admin_command';
+      
+      if (!isImportantFunction) {
+        return 'none'; // Ignorer complètement
+      }
+      
+      // Pour les présences dans les groupes, retourner l'action appropriée
+      if (classification.type === 'attendance') {
+        return extractedInfo.action || 'arrival';
+      }
+    } else if (context && context.isGroup && isBotMentioned) {
+      // Si le bot est mentionné dans un groupe, permettre les conversations libres
+      if (classification.type === 'free_chat' || classification.type === 'mention') {
+        return 'free_chat';
+      }
+    }
+    
+    // Vérifier le seuil de confiance seulement si ce n'est pas une mention de bot dans un groupe
+    if (!(context && context.isGroup && isBotMentioned && (classification.type === 'free_chat' || classification.type === 'mention'))) {
+      if (classification.confidence < effectiveThreshold) {
+        return 'none';
+      }
     }
 
     switch (classification.type) {
@@ -473,9 +557,23 @@ class AIAgent {
             response = `✅ Arrivées enregistrées à ${arrivalTime} pour : ${mentionedNames.join(', ')}\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !`;
           } else {
             // Enregistrer l'arrivée normale
-            await this.saveAttendanceToDatabase(employee, 'arrival', analysis.extractedInfo, context);
+            const result = await this.saveAttendanceToDatabase(employee, 'arrival', analysis.extractedInfo, context);
+            
+            // Vérifier s'il y a une erreur de doublon
+            if (result && result.error === 'duplicate') {
+              response = `⚠️ ${result.message}`;
+            } else {
             const arrivalTime = new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+              
+              // Vérifier si c'était un retard
+              const isLate = result && result.isLate;
+              if (isLate) {
+                // Pas de message dans le groupe pour les retards, seul le message privé est envoyé
+                response = null;
+              } else {
             response = `✅ Arrivée enregistrée à ${arrivalTime}\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !`;
+              }
+            }
           }
           break;
         
@@ -523,9 +621,15 @@ class AIAgent {
           } else {
             // Enregistrer le départ normal
             const departureResult = await this.saveAttendanceToDatabase(employee, 'departure', analysis.extractedInfo, context);
+            
+            // Vérifier s'il y a une erreur de doublon
+            if (departureResult && departureResult.error === 'duplicate') {
+              response = `⚠️ ${departureResult.message}`;
+            } else {
             const departureTime = new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
             const workHours = departureResult ? departureResult.totalHours.toFixed(2) : '0.00';
             response = `✅ Départ enregistré à ${departureTime}\n📊 Heures travaillées: ${workHours}h\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !`;
+            }
           }
           break;
         
@@ -570,17 +674,29 @@ class AIAgent {
             response = `🍽️ Pauses déjeuner commencées à ${lunchTime} pour : ${mentionedNames.join(', ')}\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !`;
           } else {
             // Enregistrer la pause normale
-            await this.saveAttendanceToDatabase(employee, 'lunch_break', analysis.extractedInfo, context);
+            const lunchResult = await this.saveAttendanceToDatabase(employee, 'lunch_break', analysis.extractedInfo, context);
+            
+            // Vérifier s'il y a une erreur de doublon
+            if (lunchResult && lunchResult.error === 'duplicate') {
+              response = `⚠️ ${lunchResult.message}`;
+            } else {
             const lunchTime = new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
             response = `🍽️ Pause déjeuner commencée à ${lunchTime}\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !`;
+            }
           }
           break;
         
         case 'lunch_return':
           // Enregistrer le retour de pause en base de données
-          await this.saveAttendanceToDatabase(employee, 'lunch_return', analysis.extractedInfo, context);
+          const returnResult = await this.saveAttendanceToDatabase(employee, 'lunch_return', analysis.extractedInfo, context);
+          
+          // Vérifier s'il y a une erreur de doublon
+          if (returnResult && returnResult.error === 'duplicate') {
+            response = `⚠️ ${returnResult.message}`;
+          } else {
           const returnTime = new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
           response = `✅ Retour de pause à ${returnTime}\n\n💡 Tapez "/" pour découvrir ce que je peux faire pour vous !`;
+          }
           break;
         
         case 'absence':
@@ -627,7 +743,7 @@ class AIAgent {
         
         case 'provide_help':
           if (isPrivate) {
-            response = `🤖 Salut ! Je suis votre assistant personnel. Voici ce que je peux faire pour vous :
+            response = `👨‍💼 Salut ! Je suis Mr le Manager, l'assistant IA de Promillys. Voici ce que je peux faire pour vous :
 
 *📅 Gestion de présence :*
 • "Je suis arrivé" ou "Bonjour" → Marquer votre arrivée
@@ -647,7 +763,7 @@ class AIAgent {
 
 Parlez-moi naturellement, je vous comprends ! 😊`;
           } else {
-            response = `🤖 Je peux vous aider avec :
+            response = `👨‍💼 Je peux vous aider avec :
 • Marquer votre présence (arrivée, départ, pause)
 • Demander des permissions
 • Consulter votre statut
@@ -657,9 +773,9 @@ Parlez-moi naturellement, je vous comprends ! 😊`;
         
         case 'greet_back':
           if (isPrivate) {
-            response = `👋 Salut ! Je suis votre assistant personnel. Comment puis-je vous aider aujourd'hui ? 😊`;
+            response = `👨‍💼 Salut ! Je suis Mr le Manager, l'assistant IA de Promillys. Comment puis-je vous aider aujourd'hui ? 😊`;
           } else {
-            response = `👋 Bonjour ! Comment puis-je vous aider aujourd'hui ?`;
+            response = `👨‍💼 Bonjour ! Je suis Mr le Manager, l'assistant IA de Promillys. Comment puis-je vous aider aujourd'hui ?`;
           }
           break;
         
@@ -696,43 +812,175 @@ Parlez-moi naturellement, je vous comprends ! 😊`;
    */
   async generateFreeChatResponse(message, context) {
     try {
-      const messageLower = message.toLowerCase();
+      const messageLower = message.toLowerCase().trim();
       const isPrivate = !context.isGroup;
       const author = context.author || 'Utilisateur';
       
+      console.log(`🤖 Génération de réponse libre pour: "${message}"`);
+      
+      // Gérer les salutations simples avec des réponses courtes et naturelles
+      if (this.isSimpleGreeting(message)) {
+        console.log(`👋 Salutation simple détectée`);
+        return this.generateSimpleGreetingResponse(message, context);
+      }
+      
+      // Vérifier si c'est une question de suivi (référence à une conversation précédente)
+      if (this.isFollowUpQuestion(message)) {
+        console.log(`🔄 Question de suivi détectée`);
+        // Utiliser la nouvelle API Cohere avec le modèle command-a-03-2025
+        const cohereResponse = await this.generateCohereWithNewModel(message, context);
+        if (cohereResponse && cohereResponse.trim() && cohereResponse.length > 5) {
+          console.log(`✅ Réponse Cohere contextuelle générée: ${cohereResponse.substring(0, 50)}...`);
+          return cohereResponse;
+        }
+      }
+      
       // Vérifier si c'est une question sur les fonctionnalités du bot
       if (this.isBotFunctionalityQuestion(message)) {
+        console.log(`📋 Question sur les fonctionnalités détectée`);
         return this.generateBotFunctionalityResponse(message, context);
       }
       
-      // Pour toutes les autres conversations, utiliser l'IA générative
+      // Utiliser en priorité l'API Cohere avec le nouveau modèle (command-a-03-2025)
+      console.log(`🤖 Utilisation de Cohere avec modèle command-a-03-2025...`);
+      const cohereResponse = await this.generateCohereWithNewModel(message, context);
+      if (cohereResponse && cohereResponse.trim() && cohereResponse.length > 5) {
+        console.log(`✅ Réponse Cohere générée: ${cohereResponse.substring(0, 50)}...`);
+        return cohereResponse;
+      }
+      
+      // Si Cohere échoue, essayer avec l'IA conversationnelle classique
+      console.log(`🔄 Tentative avec IA conversationnelle classique...`);
       const aiResponse = await this.generateAIGenerativeResponse(message, context);
-      if (aiResponse) {
+      if (aiResponse && aiResponse.trim() && aiResponse.length > 5) {
+        console.log(`✅ Réponse IA générée: ${aiResponse.substring(0, 50)}...`);
         return aiResponse;
       }
       
-      // Fallback minimal seulement si l'IA échoue complètement
-      return `😊 C'est intéressant ! Peux-tu me dire plus sur ce sujet ? 😊`;
+      // Si l'IA échoue, essayer avec une API alternative
+      console.log(`🔄 Tentative avec API alternative...`);
+      const alternativeResponse = await this.generateAlternativeAIResponse(message, context);
+      if (alternativeResponse && alternativeResponse.trim() && alternativeResponse.length > 5) {
+        console.log(`✅ Réponse alternative générée: ${alternativeResponse.substring(0, 50)}...`);
+        return alternativeResponse;
+      }
+      
+      // Dernier recours : demander à l'utilisateur de reformuler
+      console.log(`⚠️ Aucune IA n'a pu générer de réponse`);
+      return `👨‍💼 Désolé, je n'arrive pas à générer une réponse pour le moment. Pouvez-vous reformuler votre message ?`;
       
     } catch (error) {
       console.error('Erreur lors de la génération de réponse libre:', error);
-      return `😊 Désolé, je n'ai pas bien compris. Peux-tu reformuler ? 😊`;
+      return `👨‍💼 Désolé, je n'ai pas bien compris. Peux-tu reformuler ? 😊`;
     }
+  }
+
+  /**
+   * Vérifie si c'est une question de suivi (référence à une conversation précédente)
+   */
+  isFollowUpQuestion(message) {
+    const messageLower = message.toLowerCase().trim();
+    
+    const followUpKeywords = [
+      'pourquoi', 'comment', 'quand', 'où', 'qui', 'quoi',
+      'tu', 'toi', 'vous', 'il', 'elle', 'ça', 'ce', 'cette',
+      'déjà', 'encore', 'toujours', 'maintenant', 'après',
+      'avant', 'plus', 'moins', 'aussi', 'même', 'autre',
+      'comprends', 'comprends pas', 'sais', 'sais pas',
+      'fais', 'fais quoi', 'fais ça', 'fais là'
+    ];
+    
+    return followUpKeywords.some(keyword => messageLower.includes(keyword));
+  }
+
+  /**
+   * Vérifie si c'est une salutation simple
+   */
+  isSimpleGreeting(message) {
+    const messageLower = message.toLowerCase().trim();
+    
+    const simpleGreetings = [
+      'salut', 'bonjour', 'bonsoir', 'bonne nuit', 'bonne journée',
+      'ça va', 'ca va', 'comment ça va', 'comment ca va', 'ça va?', 'ca va?',
+      'ok', 'd\'accord', 'daccord', 'parfait', 'super',
+      'merci', 'merci beaucoup', 'à bientôt', 'a bientot',
+      'bye', 'au revoir', 'à plus', 'a plus'
+    ];
+    
+    return simpleGreetings.some(greeting => messageLower === greeting);
+  }
+
+  /**
+   * Génère une réponse simple pour les salutations
+   */
+  generateSimpleGreetingResponse(message, context) {
+    const messageLower = message.toLowerCase().trim();
+    const isPrivate = !context.isGroup;
+    const author = context.author || 'Utilisateur';
+    
+    // Réponses courtes et naturelles selon le type de salutation
+    if (messageLower.includes('salut') || messageLower.includes('bonjour') || messageLower.includes('bonsoir')) {
+      return `Salut ! Comment ça va ?`;
+    }
+    
+    if (messageLower.includes('ça va') || messageLower.includes('ca va') || messageLower.includes('comment')) {
+      return `Ça va bien, merci ! Et toi ?`;
+    }
+    
+    if (messageLower === 'ok' || messageLower === 'd\'accord' || messageLower === 'daccord') {
+      return `Ok ! Que veux-tu faire ?`;
+    }
+    
+    if (messageLower.includes('merci')) {
+      return `De rien ! Autre chose ?`;
+    }
+    
+    if (messageLower.includes('bye') || messageLower.includes('au revoir') || messageLower.includes('à plus')) {
+      return `À bientôt !`;
+    }
+    
+    // Réponses pour les questions de suivi
+    if (messageLower.includes('rappel') || messageLower.includes('souviens') || messageLower.includes('demandé')) {
+      return `Désolé, je n'ai pas bien compris ta question. Peux-tu reformuler ?`;
+    }
+    
+    // Réponse par défaut pour les autres salutations
+    return `Salut ! Comment ça va ?`;
   }
 
   /**
    * Vérifie si c'est une question sur les fonctionnalités du bot
    */
   isBotFunctionalityQuestion(message) {
+    const messageLower = message.toLowerCase();
+    
+    // Mots-clés spécifiques pour les fonctionnalités du bot
     const functionalityKeywords = [
       'présence', 'presence', 'arrivée', 'arrive', 'départ', 'depart',
       'permission', 'congé', 'conge', 'pause', 'déjeuner', 'dejeuner',
-      'statut', 'aide', 'help', 'que faire', 'comment faire'
+      'statut', 'aide', 'help'
     ];
     
-    return functionalityKeywords.some(keyword => 
-      message.toLowerCase().includes(keyword)
+    // Questions directes sur les fonctionnalités
+    const directQuestions = [
+      'que peux-tu faire', 'que peux tu faire', 'que sais-tu faire', 'que sais tu faire',
+      'comment marquer', 'comment faire pour', 'comment utiliser',
+      'quelles sont tes fonctionnalités', 'quelles sont tes capacités'
+    ];
+    
+    // Vérifier les mots-clés de fonctionnalités
+    const hasFunctionalityKeyword = functionalityKeywords.some(keyword => 
+      messageLower.includes(keyword)
     );
+    
+    // Vérifier les questions directes
+    const hasDirectQuestion = directQuestions.some(question => 
+      messageLower.includes(question)
+    );
+    
+    // Ne considérer comme question de fonctionnalité que si c'est une question directe
+    // ou si le message contient des mots-clés ET se termine par un point d'interrogation
+    return hasDirectQuestion || (hasFunctionalityKeyword && messageLower.includes('?'));
   }
 
   /**
@@ -743,25 +991,40 @@ Parlez-moi naturellement, je vous comprends ! 😊`;
     const author = context.author || 'Utilisateur';
     
     if (isPrivate) {
-      return `🤖 Salut ${author} ! Je suis ton assistant IA personnel. Je peux t'aider avec :
+      return `👨‍💼 Salut ${author} ! Je suis Mr le Manager, l'assistant IA de Promillys. Voici ce que je peux faire pour toi :
 
 *📅 Gestion de présence :*
-• "Je suis arrivé" ou "Bonjour" → Marquer votre arrivée
-• "Je pars" ou "Au revoir" → Marquer votre départ  
+• "Je suis arrivé" ou "Bonjour" → Marquer ton arrivée
+• "Je pars" ou "Au revoir" → Marquer ton départ  
 • "Je vais en pause" → Commencer la pause déjeuner
 • "Je reviens de pause" → Finir la pause
 • "Je ne viens pas" → Déclarer une absence
+• "Mon statut" → Voir ta présence du jour
 
 *📋 Demandes de permissions :*
 • "Je veux prendre congé du 15/12 au 20/12" → Demander un congé
 • "Je suis malade du 10/12 au 12/12" → Demander un arrêt maladie
+• "Permission médicale" → Demande de permission médicale
 
-*💬 Conversations libres :*
+*💬 Conversations et aide :*
 • Parle-moi de n'importe quoi, je te réponds !
+• Pose-moi des questions sur le travail, la vie, etc.
+• Je peux t'aider avec des conseils et des discussions
 
-Que veux-tu faire ? 😊`;
+*ℹ️ Informations :*
+• "Aide" → Afficher cette aide
+• "Que peux-tu faire" → Voir mes capacités
+
+Parle-moi naturellement, je te comprends ! Que veux-tu faire ? 😊`;
     } else {
-      return `🤖 Je peux aider avec les présences, permissions et répondre aux questions ! 😊`;
+      return `👨‍💼 Je peux t'aider avec :
+• Marquer ta présence (arrivée, départ, pause)
+• Demander des permissions et congés
+• Consulter ton statut de présence
+• Répondre à tes questions
+• Avoir des conversations libres
+
+Dis-moi ce dont tu as besoin ! 😊`;
     }
   }
 
@@ -773,23 +1036,322 @@ Que veux-tu faire ? 😊`;
       const isPrivate = !context.isGroup;
       const author = context.author || 'Utilisateur';
       
+      console.log(`🤖 Tentative de génération IA pour: "${message}"`);
+      
       // Vérifier si c'est une question sur les fonctionnalités du bot
       if (this.isBotFunctionalityQuestion(message)) {
+        console.log(`📋 Question fonctionnalité détectée, utilisation du fallback`);
         return this.generateBotFunctionalityResponse(message, context);
       }
       
-      // Utiliser une vraie IA conversationnelle
+      // Utiliser uniquement l'IA conversationnelle
+      console.log(`🤖 Appel à l'IA conversationnelle...`);
       const aiResponse = await this.generateConversationalAIResponse(message, context);
-      if (aiResponse) {
+      if (aiResponse && aiResponse.trim() && aiResponse.length > 5) {
+        console.log(`✅ Réponse IA reçue: ${aiResponse.substring(0, 100)}...`);
         return aiResponse;
       }
       
-      // Fallback intelligent basé sur le contexte
-      return this.generateIntelligentFallback(message, context);
+      console.log(`⚠️ IA conversationnelle n'a pas généré de réponse valide`);
+      return null; // Pas de fallback prédéfini
       
     } catch (error) {
       console.error('Erreur lors de la génération IA:', error);
-      return this.generateIntelligentFallback(message, context);
+      return null; // Pas de fallback prédéfini
+    }
+  }
+
+  /**
+   * Génère une réponse avec Cohere et le nouveau modèle command-a-03-2025
+   */
+  async generateCohereWithNewModel(message, context) {
+    try {
+      const author = context.author || 'Utilisateur';
+      const isPrivate = !context.isGroup;
+      
+      console.log(`🤖 Appel Cohere avec modèle command-a-03-2025 pour: "${message}"`);
+      
+      // Récupérer l'historique des messages
+      const chatHistory = await this.getChatHistory(context.chatId, 6);
+      
+      // Construire les messages pour l'API chat
+      const messages = [
+        {
+          role: "system",
+          content: `Tu es Mr le Manager de Promillys. Tu gères les présences et tous besoins de l'entreprise et conseils.
+
+RÈGLES ABSOLUES:
+- Réponds UNIQUEMENT en français
+- Sois simple et direct
+- Reste dans ton rôle de gestionnaire
+- Ne donne JAMAIS de recettes ou conseils non liés au travail
+
+EXEMPLES OBLIGATOIRES:
+- "Salut" → "Salut ! Comment ça va ?"
+- "Ça va bien et toi ?" → "Ça va très bien, merci !"
+- "Comment faire des gâteaux" → "Je ne peux pas t'aider avec ça, je gère les présences."
+- "Comment tu vas ?" → "Ça va bien, merci !"`
+        }
+      ];
+
+      // Ajouter l'historique des conversations
+      if (chatHistory.length > 0) {
+        const recentMessages = chatHistory.slice(-4); // Garder les 4 derniers messages
+        
+        recentMessages.forEach(msg => {
+          // Déterminer l'expéditeur
+          let role;
+          if (msg.from_number === 'BOT') {
+            role = "assistant";
+          } else {
+            const msgFrom = msg.from_number.replace('@c.us', '');
+            const userPhone = context.userPhone.replace('@c.us', '');
+            role = msgFrom === userPhone ? "user" : "assistant";
+          }
+          
+          // Ajouter le message à l'historique
+          messages.push({
+            role: role,
+            content: msg.content
+          });
+        });
+      }
+      
+      // Ajouter le message actuel
+      messages.push({
+        role: "user",
+        content: message
+      });
+      
+      console.log(`📝 Messages à envoyer: ${JSON.stringify(messages, null, 2)}`);
+      
+      // Appeler l'API Cohere Chat avec le modèle command-a-03-2025
+      const response = await this.cohereV2.chat({
+        model: "command-a-03-2025",
+        messages: messages,
+        temperature: 0.3,
+        max_tokens: 50
+      });
+      
+      console.log(`📝 Réponse reçue: ${JSON.stringify(response, null, 2)}`);
+
+      if (response && response.message && response.message.content && response.message.content[0] && response.message.content[0].text) {
+        let generatedText = response.message.content[0].text.trim();
+        
+        // Nettoyer la réponse
+        generatedText = generatedText
+          .replace(/^(Assistant:|Bot:|AI:|Mr le Manager:)/gi, '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        
+        // Vérifier si la réponse est en français
+        if (!this.isFrenchText(generatedText)) {
+          console.log(`⚠️ Réponse Cohere en anglais détectée, rejetée`);
+          return null;
+        }
+        
+        // Pas de limitation de longueur - laisser l'IA répondre naturellement
+        
+        if (generatedText.length > 5) {
+          console.log(`✅ Réponse Cohere générée: ${generatedText}...`);
+          return generatedText;
+        }
+      }
+      
+      console.log(`⚠️ Cohere n'a pas généré de réponse valide`);
+      return null;
+      
+    } catch (error) {
+      console.error('Erreur lors de l\'appel Cohere:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Génère une réponse avec la nouvelle API Cohere Chat (avec historique)
+   */
+  async generateCohereChatResponse(message, context) {
+    try {
+      const author = context.author || 'Utilisateur';
+      const isPrivate = !context.isGroup;
+      
+      console.log(`🤖 Appel Cohere Chat pour: "${message}"`);
+      
+      // Récupérer l'historique des messages
+      const chatHistory = await this.getChatHistory(context.chatId, 10);
+      
+      // Construire les messages pour l'API chat
+      const messages = [
+        {
+          role: "system",
+          content: `Tu es Mr le Manager de Promillys. Tu gères les présences et tous besoins de l'entreprise et conseils.
+
+RÈGLES ABSOLUES:
+- Réponds UNIQUEMENT en français
+- Sois simple et direct
+- Reste dans ton rôle de gestionnaire
+- Ne donne JAMAIS de recettes ou conseils non liés au travail
+
+EXEMPLES OBLIGATOIRES:
+- "Salut" → "Salut ! Comment ça va ?"
+- "Ça va bien et toi ?" → "Ça va très bien, merci !"
+- "Comment faire des gâteaux" → "Je ne peux pas t'aider avec ça, je gère les présences."
+- "Comment tu vas ?" → "Ça va bien, merci !"`
+        }
+      ];
+      
+      // Ajouter l'historique des conversations
+      if (chatHistory.length > 0) {
+        const recentMessages = chatHistory.slice(-8); // Garder les 8 derniers messages
+        
+        recentMessages.forEach(msg => {
+          // Déterminer l'expéditeur
+          let sender;
+          if (msg.from_number === 'BOT') {
+            sender = "assistant";
+          } else {
+            const msgFrom = msg.from_number.replace('@c.us', '');
+            const userPhone = context.userPhone.replace('@c.us', '');
+            sender = msgFrom === userPhone ? "user" : "assistant";
+          }
+          
+          // Ajouter le message à l'historique
+          messages.push({
+            role: sender,
+            content: msg.content
+          });
+        });
+      }
+      
+      // Ajouter le message actuel
+      messages.push({
+        role: "user",
+        content: message
+      });
+      
+      // Construire le prompt pour l'API generate
+      let prompt = messages[0].content + "\n\n";
+      
+      // Ajouter l'historique
+      for (let i = 1; i < messages.length - 1; i++) {
+        const msg = messages[i];
+        if (msg.role === "user") {
+          prompt += `Utilisateur: ${msg.content}\n`;
+        } else {
+          prompt += `Mr le Manager: ${msg.content}\n`;
+        }
+      }
+      
+      // Ajouter le message actuel
+      prompt += `Utilisateur: ${messages[messages.length - 1].content}\nMr le Manager:`;
+      
+      console.log(`📝 Prompt construit: ${prompt.substring(0, 200)}...`);
+      
+      // Appeler l'API Cohere Generate avec le nouveau modèle
+      const response = await this.cohere.generate({
+        model: "command-a-03-2025",
+        prompt: prompt,
+        temperature: 0.3,
+        max_tokens: 150
+      });
+      
+      console.log(`📝 Réponse reçue: ${JSON.stringify(response, null, 2)}`);
+
+      if (response && response.text) {
+        let generatedText = response.text.trim();
+        
+        // Nettoyer la réponse
+        generatedText = generatedText
+          .replace(/^(Assistant:|Bot:|AI:|Mr le Manager:)/gi, '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        
+        // Vérifier si la réponse est en français
+        if (!this.isFrenchText(generatedText)) {
+          console.log(`⚠️ Réponse Cohere Chat en anglais détectée, rejetée`);
+          return null;
+        }
+        
+        // Pas de limitation de longueur - laisser l'IA répondre naturellement
+        
+        if (generatedText.length > 5) {
+          console.log(`✅ Réponse Cohere Chat générée: ${generatedText}...`);
+          return generatedText;
+        }
+      }
+      
+      console.log(`⚠️ Cohere Chat n'a pas généré de réponse valide`);
+      return null;
+      
+    } catch (error) {
+      console.error('Erreur lors de l\'appel Cohere Chat:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Génère une réponse avec Cohere (API gratuite qui fonctionne)
+   */
+  async generateAlternativeAIResponse(message, context) {
+    try {
+      const author = context.author || 'Utilisateur';
+      const isPrivate = !context.isGroup;
+      
+      console.log(`🔄 Tentative avec Cohere pour: "${message}"`);
+      
+      // Utiliser l'API Cohere avec la personnalité de Mr le Manager
+      const response = await this.cohere.generate({
+        model: 'command',
+        prompt: `Tu es Mr le Manager de Promillys. Tu gères les présences et tous besoins de l'entreprise et conseils.
+
+RÈGLES ABSOLUES:
+- Réponds UNIQUEMENT en français
+- Sois simple et direct
+- Reste dans ton rôle de gestionnaire
+- Ne donne JAMAIS de recettes ou conseils non liés au travail
+
+EXEMPLES OBLIGATOIRES:
+- "Salut" → "Salut ! Comment ça va ?"
+- "Ça va bien et toi ?" → "Ça va très bien, merci !"
+- "Comment faire des gâteaux" → "Je ne peux pas t'aider avec ça, je gère les présences."
+- "Comment tu vas ?" → "Ça va bien, merci !"
+
+Utilisateur: ${message}
+Mr le Manager:`,
+        max_tokens: 80,
+        temperature: 0.3,
+        stop_sequences: ['Utilisateur:', 'Assistant:', 'Mr le Manager:', '\n\n', 'RÈGLES:']
+      });
+
+      if (response && response.generations && response.generations[0] && response.generations[0].text) {
+        let generatedText = response.generations[0].text.trim();
+        
+        // Nettoyer la réponse
+        generatedText = generatedText
+          .replace(/^(Assistant:|Bot:|AI:|Mr le Manager:)/gi, '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        
+        // Vérifier si la réponse est en français
+        if (!this.isFrenchText(generatedText)) {
+          console.log(`⚠️ Réponse alternative en anglais détectée, rejetée`);
+          return null; // Rejeter les réponses en anglais
+        }
+        
+        // Pas de limitation de longueur - laisser l'IA répondre naturellement
+        
+        if (generatedText.length > 5) {
+          console.log(`✅ Réponse Cohere générée: ${generatedText}...`);
+          return generatedText;
+        }
+      }
+      
+      console.log(`⚠️ Cohere n'a pas généré de réponse valide`);
+      return null;
+      
+    } catch (error) {
+      console.error('Erreur Cohere:', error);
+      return null;
     }
   }
 
@@ -799,23 +1361,33 @@ Que veux-tu faire ? 😊`;
   async generateConversationalAIResponse(message, context) {
     try {
       if (!this.conversationalAI.enabled) {
+        console.log(`⚠️ IA conversationnelle désactivée`);
         return null;
       }
 
       const isPrivate = !context.isGroup;
       const author = context.author || 'Utilisateur';
       
+      console.log(`🤖 Construction du prompt pour l'IA...`);
+      
       // Construire le prompt contextuel
       const systemPrompt = this.buildSystemPrompt(context);
-      const userMessage = this.buildUserMessage(message, context);
+      const userMessage = await this.buildUserMessage(message, context);
+      
+      console.log(`📝 System prompt: ${systemPrompt.substring(0, 100)}...`);
+      console.log(`📝 User message: ${userMessage.substring(0, 100)}...`);
       
       // Appeler l'IA conversationnelle
       const response = await this.callConversationalAI(systemPrompt, userMessage, context);
       
-      if (response && response.trim()) {
-        return this.formatAIResponse(response, context);
+      if (response && response.trim() && response.length > 5) {
+        console.log(`✅ Réponse brute de l'IA: ${response.substring(0, 100)}...`);
+        const formattedResponse = this.formatAIResponse(response, context);
+        console.log(`✅ Réponse formatée: ${formattedResponse.substring(0, 100)}...`);
+        return formattedResponse;
       }
       
+      console.log(`⚠️ Aucune réponse valide de l'IA`);
       return null;
       
     } catch (error) {
@@ -832,18 +1404,77 @@ Que veux-tu faire ? 😊`;
     const author = context.author || 'Utilisateur';
     
     if (isPrivate) {
-      return `Tu es un assistant IA personnel et amical pour ${author}. Tu peux discuter de tout sujet de manière naturelle et intelligente. Tu es là pour aider, conseiller et avoir des conversations intéressantes. Réponds en français de manière chaleureuse et professionnelle.`;
+      return `Tu es Mr le Manager, l'assistant IA de Promillys. Tu es convivial et professionnel.
+
+RÈGLES STRICTES:
+- Réponds UNIQUEMENT en français, JAMAIS en anglais
+- Maximum 1-2 phrases courtes et naturelles
+- Sois amical mais professionnel
+- Réponds comme un humain normal, pas une machine
+- Utilise l'historique pour être cohérent
+- Si on te salue, salue en retour
+- Si on te demande comment tu vas, dis que ça va bien
+- Reste dans le contexte de la conversation
+
+EXEMPLES:
+- "Salut" → "Salut ! Comment ça va ?"
+- "Ça va bien et toi ?" → "Ça va très bien, merci !"
+- "Comment tu vas ?" → "Ça va bien, merci ! Et toi ?"`;
     } else {
-      return `Tu es un assistant IA pour un groupe d'employés. Tu peux participer aux discussions de groupe de manière utile et pertinente. Tu es intelligent, amical et professionnel. Réponds en français de manière concise et appropriée pour un groupe.`;
+      return `Tu es Mr le Manager, l'assistant IA de Promillys. Tu es convivial et professionnel.
+
+RÈGLES STRICTES:
+- Réponds UNIQUEMENT en français, JAMAIS en anglais
+- Maximum 1-2 phrases courtes et naturelles
+- Sois amical mais professionnel
+- Réponds comme un humain normal, pas une machine
+
+EXEMPLES:
+- "Salut" → "Salut ! Comment ça va ?"
+- "Ça va bien et toi ?" → "Ça va très bien, merci !"`;
     }
   }
 
   /**
-   * Construit le message utilisateur pour l'IA
+   * Construit le message utilisateur pour l'IA avec l'historique intelligent
    */
-  buildUserMessage(message, context) {
+  async buildUserMessage(message, context) {
     const isPrivate = !context.isGroup;
     const author = context.author || 'Utilisateur';
+    
+    if (isPrivate) {
+      // Récupérer l'historique des messages privés récents
+      const chatHistory = await this.getChatHistory(context.chatId, 8);
+      
+      if (chatHistory.length > 0) {
+        let historyText = "Conversation récente:\n";
+        
+        // Filtrer et formater l'historique
+        const recentMessages = chatHistory.slice(-6); // Garder seulement les 6 derniers
+        
+        recentMessages.forEach(msg => {
+          // Déterminer l'expéditeur
+          let sender;
+          if (msg.from_number === 'BOT') {
+            sender = "Mr le Manager";
+          } else {
+            // Normaliser les numéros pour la comparaison
+            const msgFrom = msg.from_number.replace('@c.us', '');
+            const userPhone = context.userPhone.replace('@c.us', '');
+            sender = msgFrom === userPhone ? author : "Mr le Manager";
+          }
+          
+          const time = new Date(msg.created_at).toLocaleTimeString('fr-FR', { 
+            hour: '2-digit', 
+            minute: '2-digit' 
+          });
+          historyText += `[${time}] ${sender}: "${msg.content}"\n`;
+        });
+        
+        historyText += `\nMaintenant, ${author} dit: "${message}"`;
+        return historyText;
+      }
+    }
     
     if (isPrivate) {
       return `${author} dit: "${message}"`;
@@ -853,11 +1484,66 @@ Que veux-tu faire ? 😊`;
   }
 
   /**
-   * Appelle l'IA conversationnelle (Hugging Face ou autre)
+   * Récupère l'historique des messages pour un chat avec plus de contexte
+   */
+  async getChatHistory(chatId, limit = 10) {
+    try {
+      // Vérifier que chatId est valide
+      if (!chatId) {
+        console.log('⚠️ chatId manquant pour l\'historique');
+        return [];
+      }
+
+      // S'assurer que limit est un nombre entier et valide
+      let limitInt = parseInt(limit) || 10;
+      if (limitInt <= 0 || limitInt > 100) {
+        console.log('⚠️ Limite invalide, utilisation de la valeur par défaut');
+        limitInt = 10;
+      }
+      
+      console.log(`🔍 Récupération de l'historique pour: ${chatId}`);
+      console.log(`🔍 Paramètres: chatId=${chatId}, limit=${limitInt}, type limit=${typeof limitInt}`);
+      
+      // Pour les messages privés, chercher par group_id = chatId (ID du contact)
+      // Pour les messages de groupe, chercher par group_id = groupId
+      // Note: LIMIT ne peut pas utiliser de paramètres préparés avec mysql2
+      const messages = await db.query(`
+        SELECT 
+          content,
+          from_number,
+          created_at,
+          message_type
+        FROM messages 
+        WHERE group_id = ? 
+        AND content IS NOT NULL 
+        AND content != ''
+        AND content NOT LIKE '%🤖%'
+        AND content NOT LIKE '%👨‍💼%'
+        AND LENGTH(content) > 2
+        AND LENGTH(content) < 200
+        AND content NOT LIKE '%plateforme%'
+        AND content NOT LIKE '%travail%'
+        AND content NOT LIKE '%bienvenu%'
+        ORDER BY created_at DESC 
+        LIMIT ${limitInt}
+      `, [String(chatId)]);
+      
+      console.log(`📚 ${messages.length} messages trouvés dans l'historique`);
+      return messages.reverse(); // Inverser pour avoir l'ordre chronologique
+    } catch (error) {
+      console.error('Erreur lors de la récupération de l\'historique:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Appelle l'IA conversationnelle (Cohere par défaut)
    */
   async callConversationalAI(systemPrompt, userMessage, context) {
     try {
-      if (this.conversationalAI.provider === 'huggingface') {
+      if (this.conversationalAI.provider === 'cohere') {
+        return await this.callCohereAI(systemPrompt, userMessage, context);
+      } else if (this.conversationalAI.provider === 'huggingface') {
         return await this.callHuggingFaceAI(systemPrompt, userMessage, context);
       } else if (this.conversationalAI.provider === 'openai') {
         return await this.callOpenAI(systemPrompt, userMessage, context);
@@ -871,11 +1557,129 @@ Que veux-tu faire ? 😊`;
   }
 
   /**
+   * Appelle Cohere pour la génération de texte
+   */
+  async callCohereAI(systemPrompt, userMessage, context) {
+    try {
+      const isPrivate = !context.isGroup;
+      const author = context.author || 'Utilisateur';
+      
+      console.log(`🤖 Appel Cohere pour IA conversationnelle`);
+      
+      const response = await this.cohere.generate({
+        model: 'command',
+        prompt: `${systemPrompt}
+
+${userMessage}
+Mr le Manager:`,
+        max_tokens: this.conversationalAI.maxLength,
+        temperature: this.conversationalAI.temperature,
+        stop_sequences: ['Utilisateur:', 'Assistant:', 'Mr le Manager:', '\n\n', 'RÈGLES:']
+      });
+
+      if (response && response.generations && response.generations[0] && response.generations[0].text) {
+        let generatedText = response.generations[0].text.trim();
+        
+        // Nettoyer la réponse
+        generatedText = generatedText
+          .replace(/^(Assistant:|Bot:|AI:|Mr le Manager:)/gi, '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        
+        // Vérifier si la réponse est en français
+        if (!this.isFrenchText(generatedText)) {
+          console.log(`⚠️ Réponse en anglais détectée, utilisation du fallback`);
+          return null; // Forcer l'utilisation du fallback
+        }
+        
+        // Pas de limitation de longueur - laisser l'IA répondre naturellement
+        
+        if (generatedText.length > 5) {
+          console.log(`✅ Réponse Cohere générée: ${generatedText}...`);
+          return generatedText;
+        }
+      }
+      
+      console.log('⚠️ Aucune réponse générée par Cohere');
+      return null;
+      
+    } catch (error) {
+      console.error('Erreur lors de l\'appel à Cohere:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Vérifie si le texte est en français
+   */
+  isFrenchText(text) {
+    const frenchWords = ['je', 'tu', 'il', 'elle', 'nous', 'vous', 'ils', 'elles', 'le', 'la', 'les', 'un', 'une', 'des', 'du', 'de', 'et', 'ou', 'mais', 'donc', 'car', 'ni', 'que', 'qui', 'quoi', 'où', 'quand', 'comment', 'pourquoi', 'bonjour', 'salut', 'merci', 'oui', 'non', 'peut', 'peux', 'peuvent', 'dois', 'doit', 'doivent', 'veux', 'veut', 'veulent', 'aide', 'aider', 'besoin', 'faire', 'être', 'avoir', 'aller', 'venir', 'voir', 'savoir', 'pouvoir', 'vouloir', 'devoir', 'falloir', 'ça', 'va', 'bien', 'mal', 'très', 'trop', 'plus', 'moins', 'tout', 'tous', 'toute', 'toutes'];
+    const englishWords = ['the', 'and', 'you', 'are', 'for', 'not', 'with', 'this', 'that', 'have', 'will', 'can', 'could', 'should', 'would', 'hello', 'hi', 'yes', 'no', 'thank', 'thanks', 'sorry', 'excuse', 'understand', 'help', 'please', 'good', 'bad', 'very', 'much', 'more', 'less', 'all', 'some', 'any', 'what', 'when', 'where', 'why', 'how', 'who', 'which'];
+    
+    const textLower = text.toLowerCase();
+    const frenchWordCount = frenchWords.filter(word => textLower.includes(word)).length;
+    const englishWordCount = englishWords.filter(word => textLower.includes(word)).length;
+    
+    // Si plus de mots anglais que français, c'est probablement en anglais
+    if (englishWordCount > frenchWordCount && englishWordCount > 0) {
+      return false;
+    }
+    
+    return frenchWordCount > 0 || text.length < 20;
+  }
+
+  /**
+   * Traduit une réponse en anglais vers le français
+   */
+  translateToFrench(text, context) {
+    const isPrivate = !context.isGroup;
+    const author = context.author || 'Utilisateur';
+    
+    // Réponses de fallback en français pour les salutations communes
+    const lowerText = text.toLowerCase();
+    
+    if (lowerText.includes('hello') || lowerText.includes('hi')) {
+      return `Salut ! Comment ça va ?`;
+    }
+    
+    if (lowerText.includes('how are you') || lowerText.includes('how do you do')) {
+      return `Ça va bien, merci ! Et toi ?`;
+    }
+    
+    if (lowerText.includes('good morning') || lowerText.includes('good afternoon')) {
+      return `Bonjour ! Comment puis-je t'aider ?`;
+    }
+    
+    if (lowerText.includes('thank you') || lowerText.includes('thanks')) {
+      return `De rien ! Autre chose ?`;
+    }
+    
+    if (lowerText.includes('goodbye') || lowerText.includes('bye')) {
+      return `À bientôt !`;
+    }
+    
+    if (lowerText.includes('commitment') || lowerText.includes('team') || lowerText.includes('working')) {
+      return `Parfait ! Comment puis-je t'aider ?`;
+    }
+    
+    if (lowerText.includes('understand') || lowerText.includes('comprehension')) {
+      return `D'accord ! Que veux-tu savoir ?`;
+    }
+    
+    // Réponse générique en français
+    return `Salut ! Comment puis-je t'aider ?`;
+  }
+
+  /**
    * Appelle Hugging Face pour la génération de texte
    */
   async callHuggingFaceAI(systemPrompt, userMessage, context) {
     try {
+      // Format pour GPT-2
       const prompt = `${systemPrompt}\n\n${userMessage}\n\nAssistant:`;
+      
+      console.log(`🤖 Appel Hugging Face avec GPT-2`);
+      console.log(`📝 Prompt: ${prompt.substring(0, 100)}...`);
       
       const response = await this.hf.textGeneration({
         model: this.conversationalAI.model,
@@ -884,19 +1688,62 @@ Que veux-tu faire ? 😊`;
           max_new_tokens: this.conversationalAI.maxLength,
           temperature: this.conversationalAI.temperature,
           return_full_text: false,
-          do_sample: true
+          do_sample: true,
+          top_p: 0.9,
+          repetition_penalty: 1.1,
+          pad_token_id: 50256 // Token de padding pour DialoGPT
         }
       });
 
       if (response && response[0] && response[0].generated_text) {
-        return response[0].generated_text.trim();
+        let generatedText = response[0].generated_text.trim();
+        
+        // Nettoyer la réponse GPT-2
+        generatedText = this.cleanGPT2Response(generatedText);
+        
+        console.log(`✅ Réponse générée: ${generatedText.substring(0, 100)}...`);
+        return generatedText;
       }
       
+      console.log('⚠️ Aucune réponse générée par Hugging Face');
       return null;
     } catch (error) {
-      console.error('Erreur Hugging Face:', error);
+      console.error('❌ Erreur Hugging Face:', error);
       return null;
     }
+  }
+
+  /**
+   * Nettoie les réponses de GPT-2
+   */
+  cleanGPT2Response(text) {
+    let cleaned = text
+      // Supprimer les préfixes indésirables
+      .replace(/^(Assistant:|Bot:|AI:|Réponse:)/gi, '')
+      .replace(/^(Je suis|Je pense|Je crois|Je vais|Je peux)/gi, '')
+      // Supprimer les répétitions communes
+      .replace(/\b(je|tu|il|elle|nous|vous|ils|elles)\s+\1\b/gi, '$1')
+      .replace(/\b(et|mais|donc|alors|puis)\s+\1\b/gi, '$1')
+      .replace(/\b(oui|non|bien|très|trop)\s+\1\b/gi, '$1')
+      // Nettoyer les espaces
+      .replace(/\s+/g, ' ')
+      .trim();
+    
+    // Supprimer les réponses trop courtes ou génériques
+    if (cleaned.length < 5 || 
+        cleaned.toLowerCase().includes('ah oui') || 
+        cleaned.toLowerCase().includes('raconte-moi') ||
+        cleaned.toLowerCase().includes('c\'est intéressant') ||
+        cleaned.toLowerCase().includes('c est intéressant')) {
+      return null; // Rejeter les réponses génériques
+    }
+    
+    // Limiter la longueur
+    if (cleaned.length > 300) {
+      cleaned = cleaned.substring(0, 300) + '...';
+    }
+    
+    return cleaned;
   }
 
   /**
@@ -941,11 +1788,12 @@ Que veux-tu faire ? 😊`;
       .replace(/Assistant:/g, '')
       .replace(/User:/g, '')
       .replace(/Bot:/g, '')
+      .replace(/Mr le Manager:/g, '')
       .trim();
     
     // Ajouter un emoji si la réponse n'en a pas
     if (!cleanResponse.match(/[\u{1F600}-\u{1F64F}]|[\u{1F300}-\u{1F5FF}]|[\u{1F680}-\u{1F6FF}]|[\u{1F1E0}-\u{1F1FF}]/u)) {
-      cleanResponse = `🤖 ${cleanResponse}`;
+      cleanResponse = `👨‍💼 ${cleanResponse}`;
     }
     
     return cleanResponse;
@@ -959,9 +1807,41 @@ Que veux-tu faire ? 😊`;
     const author = context.author || 'Utilisateur';
     const messageLower = message.toLowerCase();
     
-    // Analyser le sentiment et le sujet
-    const sentiment = this.analyzeSentiment(message);
-    const topic = this.identifyTopic(message);
+    // Questions spécifiques sur les capacités du bot
+    if (messageLower.includes('que peux-tu faire') || messageLower.includes('que peux tu faire') ||
+        messageLower.includes('qu\'est-ce que tu peux faire') || messageLower.includes('qu est ce que tu peux faire') ||
+        messageLower.includes('tes capacités') || messageLower.includes('tes capacites') ||
+        messageLower.includes('que sais-tu faire') || messageLower.includes('que sais tu faire')) {
+      return this.generateBotFunctionalityResponse(message, context);
+    }
+    
+    // Questions sur ce qu'est un chat
+    if (messageLower.includes('c\'est quoi un chat') || messageLower.includes('c est quoi un chat') ||
+        messageLower.includes('qu\'est-ce qu\'un chat') || messageLower.includes('qu est ce qu un chat') ||
+        messageLower.includes('définition chat') || messageLower.includes('definition chat')) {
+      return `💬 Un chat est une conversation en temps réel, généralement par messages textuels. C'est un moyen de communication instantané où on peut échanger des idées, poser des questions et partager des informations rapidement ! 😊`;
+    }
+    
+    // Questions sur l'heure d'arrivée
+    if (messageLower.includes('à quelle heure') || messageLower.includes('a quelle heure') ||
+        messageLower.includes('quelle heure') || messageLower.includes('heure d\'arrivée') ||
+        messageLower.includes('heure d arrivee') || messageLower.includes('je suis venue') ||
+        messageLower.includes('je suis venu') || messageLower.includes('arrivée à')) {
+      return `⏰ Pour vérifier votre heure d'arrivée, je peux consulter vos présences. Cependant, cette fonctionnalité nécessite que vous soyez enregistré dans notre système. Pouvez-vous me dire votre nom ou votre numéro d'employé ? 😊`;
+    }
+    
+    // Questions sur les présences
+    if (messageLower.includes('présence') || messageLower.includes('presence') ||
+        messageLower.includes('mon statut') || messageLower.includes('statut du jour') ||
+        messageLower.includes('aujourd\'hui') || messageLower.includes('aujourd hui')) {
+      return `📊 Pour consulter votre présence, je peux vous aider ! Dites-moi simplement "mon statut" ou "présence" et je vérifierai vos informations. 😊`;
+    }
+    
+    // Questions sur les permissions
+    if (messageLower.includes('permission') || messageLower.includes('congé') || messageLower.includes('conge') ||
+        messageLower.includes('vacances') || messageLower.includes('absence')) {
+      return `📋 Pour les permissions et congés, je peux vous aider à faire une demande ! Dites-moi simplement "je veux prendre congé" suivi des dates et je vous guiderai. 😊`;
+    }
     
     // Réponses spécialisées basées sur le contenu exact
     if (messageLower.includes('retard') || messageLower.includes('en retard')) {
@@ -1012,15 +1892,6 @@ Que veux-tu faire ? 😊`;
       return this.generateResponseAboutFood(message, context);
     }
     
-    // Réponses basées sur le sentiment
-    if (sentiment === 'positive') {
-      return `😊 C'est formidable ! Je suis ravi que vous ayez une expérience positive. Pouvez-vous me dire plus sur ce qui vous rend si content ?`;
-    }
-    
-    if (sentiment === 'negative') {
-      return `😔 Je comprends que la situation soit difficile. Je suis là pour vous écouter et vous aider. Que puis-je faire pour vous soutenir ?`;
-    }
-    
     // Questions de présence simples
     if (messageLower.includes('es-tu là') || messageLower.includes('es tu la') || 
         messageLower.includes('tu es là') || messageLower.includes('tu es la') ||
@@ -1052,6 +1923,21 @@ Que veux-tu faire ? 😊`;
       return `🤔 C'est une excellente question ! Laissez-moi réfléchir à cela et vous donner une réponse réfléchie.`;
     }
     
+    // Réponses spécifiques pour "Te raconter quoi"
+    if (messageLower.includes('te raconter quoi') || messageLower.includes('raconter quoi') || 
+        messageLower.includes('que raconter') || messageLower.includes('quoi raconter')) {
+      return `😊 Tu peux me raconter n'importe quoi ! Je suis là pour t'écouter et discuter avec toi. 
+      
+Par exemple, tu peux me parler de :
+• Ta journée de travail
+• Tes projets et idées
+• Tes loisirs et passions
+• Tes questions sur la vie
+• Tout ce qui te passe par la tête !
+
+Dis-moi ce qui t'intéresse ou ce qui te préoccupe, je serai ravi d'en discuter avec toi ! 😊`;
+    }
+    
     // Réponse générique intelligente
     return `🤖 C'est un sujet intéressant ! Pouvez-vous me donner plus de détails pour que je puisse mieux comprendre et vous aider ?`;
   }
@@ -1064,454 +1950,113 @@ Que veux-tu faire ? 😊`;
     const author = context.author || 'Utilisateur';
     const messageLower = message.toLowerCase();
     
-    // Analyser le contenu spécifique du message pour générer une réponse pertinente
-    if (messageLower.includes('retard') || messageLower.includes('en retard')) {
-      return this.generateResponseAboutLateness(message, context);
+    console.log(`🧠 Génération de réponse intelligente pour: "${message}"`);
+    
+    // Vérifier si c'est une question sur les fonctionnalités du bot
+    if (this.isBotFunctionalityQuestion(message)) {
+      console.log(`📋 Question sur les fonctionnalités détectée`);
+      return this.generateBotFunctionalityResponse(message, context);
     }
     
-    if (messageLower.includes('parle mal') || messageLower.includes('mal parler') || messageLower.includes('respect')) {
-      return this.generateResponseAboutRespect(message, context);
+    // AUCUNE réponse générique - retourner null pour forcer l'utilisation de l'IA
+    console.log(`⚠️ Aucune réponse prédéfinie - utilisation de l'IA requise`);
+    return null;
+  }
+
+
+
+
+
+
+
+
+  /**
+   * Vérifie si c'est une justification de retard
+   */
+  async isLateArrivalJustification(contact, message) {
+    try {
+      const db = require('../config/database');
+      const today = moment().format('YYYY-MM-DD');
+      
+      // Vérifier si l'employé a une présence en attente de justification
+      const attendance = await db.query(
+        'SELECT * FROM attendance WHERE employee_id = ? AND date = ? AND notes LIKE ?',
+        [contact.number, today, '%En attente de justification%']
+      );
+      
+      return attendance.length > 0;
+    } catch (error) {
+      console.error('Erreur lors de la vérification de justification:', error);
+      return false;
     }
-    
-    if (messageLower.includes('équipe') || messageLower.includes('collègue') || messageLower.includes('collaboration')) {
-      return this.generateResponseAboutTeam(message, context);
-    }
-    
-    if (messageLower.includes('communication') || messageLower.includes('communiquer')) {
-      return this.generateResponseAboutCommunication(message, context);
-    }
-    
-    if (messageLower.includes('décision') || messageLower.includes('choisir') || messageLower.includes('choix')) {
-      return this.generateResponseAboutDecision(message, context);
-    }
-    
-    if (messageLower.includes('problème') || messageLower.includes('difficulté') || messageLower.includes('souci')) {
-      return this.generateResponseAboutProblem(message, context);
-    }
-    
-    if (messageLower.includes('politesse') || messageLower.includes('poli') || messageLower.includes('respectueux')) {
-      return this.generateResponseAboutPoliteness(message, context);
-    }
-    
-    if (messageLower.includes('travail') || messageLower.includes('bureau') || messageLower.includes('entreprise')) {
-      return this.generateResponseAboutWork(message, context);
-    }
-    
-    if (messageLower.includes('météo') || messageLower.includes('temps') || messageLower.includes('pluie') || messageLower.includes('soleil')) {
-      return this.generateResponseAboutWeather(message, context);
-    }
-    
-    if (messageLower.includes('santé') || messageLower.includes('malade') || messageLower.includes('fatigue')) {
-      return this.generateResponseAboutHealth(message, context);
-    }
-    
-    if (messageLower.includes('technologie') || messageLower.includes('tech') || messageLower.includes('ordinateur')) {
-      return this.generateResponseAboutTechnology(message, context);
-    }
-    
-    if (messageLower.includes('nourriture') || messageLower.includes('manger') || messageLower.includes('cuisine')) {
-      return this.generateResponseAboutFood(message, context);
-    }
-    
-    // Pour les questions directes à l'IA
-    if (messageLower.includes('que penses-tu') || messageLower.includes('ton avis') || messageLower.includes('que dis-tu')) {
-      return this.generateResponseToDirectQuestion(message, context);
-    }
-    
-    // Réponse générique intelligente basée sur le sentiment
-    if (sentiment === 'positive') {
-      return `😊 C'est formidable ! Je suis ravi que vous ayez une expérience positive. Pouvez-vous me dire plus sur ce qui vous rend si content ?`;
-    }
-    
-    if (sentiment === 'negative') {
-      return `😔 Je comprends que la situation soit difficile. Je suis là pour vous écouter et vous aider. Que puis-je faire pour vous soutenir ?`;
-    }
-    
-    // Réponse générique pour encourager la conversation
-    return `🤔 C'est un sujet intéressant ! Pouvez-vous me donner plus de détails pour que je puisse mieux comprendre et vous aider ?`;
   }
 
   /**
-   * Génère une réponse sur les retards
+   * Définit les heures personnalisées pour un employé
    */
-  generateResponseAboutLateness(message, context) {
-    const responses = [
-      `⏰ Concernant les retards, je pense qu'il est important de comprendre les raisons. Une approche bienveillante avec des explications claires des conséquences fonctionne souvent mieux que des sanctions immédiates.`,
-      `🤝 Pour gérer les retards, je recommande d'abord d'écouter les raisons, puis d'établir des règles claires et équitables pour toute l'équipe.`,
-      `💡 Les retards peuvent avoir plusieurs causes. Il serait bien de discuter avec la personne concernée pour comprendre et trouver une solution ensemble.`
-    ];
-    return responses[Math.floor(Math.random() * responses.length)];
-  }
-
-  /**
-   * Génère une réponse sur le respect
-   */
-  generateResponseAboutRespect(message, context) {
-    const responses = [
-      `🤝 Si quelqu'un vous parle mal, je recommande de rester calme et professionnel. Exprimez clairement que ce comportement n'est pas acceptable et proposez de discuter de manière respectueuse.`,
-      `💪 Face à un manque de respect, il est important de fixer des limites claires tout en gardant votre dignité. Documentez les incidents si nécessaire.`,
-      `🗣️ La communication respectueuse est essentielle. Si quelqu'un vous parle mal, dites-lui poliment mais fermement que vous préférez une communication professionnelle.`
-    ];
-    return responses[Math.floor(Math.random() * responses.length)];
-  }
-
-  /**
-   * Génère une réponse sur l'équipe
-   */
-  generateResponseAboutTeam(message, context) {
-    const responses = [
-      `👥 Une équipe performante se construit sur la confiance, la communication ouverte et le respect mutuel. Chaque membre apporte une valeur unique.`,
-      `🤝 Pour une bonne dynamique d'équipe, je recommande de favoriser la collaboration, l'écoute active et la reconnaissance des efforts de chacun.`,
-      `💪 Une équipe solide partage des objectifs communs, communique efficacement et se soutient mutuellement dans les défis.`
-    ];
-    return responses[Math.floor(Math.random() * responses.length)];
-  }
-
-  /**
-   * Génère une réponse sur la communication
-   */
-  generateResponseAboutCommunication(message, context) {
-    const responses = [
-      `💬 Une bonne communication implique l'écoute active, la clarté dans les messages et l'ouverture aux différents points de vue.`,
-      `🗣️ Pour améliorer la communication, je suggère d'être précis dans vos demandes, d'écouter sans juger et de poser des questions pour clarifier.`,
-      `🤝 La communication efficace nécessite de l'empathie, de la patience et la volonté de comprendre l'autre avant d'être compris.`
-    ];
-    return responses[Math.floor(Math.random() * responses.length)];
-  }
-
-  /**
-   * Génère une réponse sur les décisions
-   */
-  generateResponseAboutDecision(message, context) {
-    const responses = [
-      `🎯 Pour prendre une bonne décision, je recommande de rassembler toutes les informations pertinentes, d'évaluer les options et de considérer les conséquences à long terme.`,
-      `🤔 Une décision réfléchie implique d'analyser les avantages et inconvénients, de consulter les personnes concernées et de prendre le temps nécessaire.`,
-      `💡 Les meilleures décisions sont souvent prises en équipe, en combinant différentes perspectives et en pesant les risques et opportunités.`
-    ];
-    return responses[Math.floor(Math.random() * responses.length)];
-  }
-
-  /**
-   * Génère une réponse sur les problèmes
-   */
-  generateResponseAboutProblem(message, context) {
-    const responses = [
-      `🔧 Pour résoudre un problème, je suggère de l'analyser étape par étape, d'identifier les causes racines et de proposer plusieurs solutions possibles.`,
-      `💡 Les problèmes sont souvent des opportunités déguisées. Approchez-les avec curiosité et créativité pour trouver des solutions innovantes.`,
-      `🤝 N'hésitez pas à demander de l'aide. Parfois, une perspective extérieure peut apporter des solutions auxquelles vous n'aviez pas pensé.`
-    ];
-    return responses[Math.floor(Math.random() * responses.length)];
-  }
-
-  /**
-   * Génère une réponse sur la politesse
-   */
-  generateResponseAboutPoliteness(message, context) {
-    const responses = [
-      `😊 La politesse en entreprise inclut l'utilisation de "s'il vous plaît", "merci", "bonjour", et le respect des horaires et des espaces de travail.`,
-      `🤝 Être poli, c'est aussi écouter activement, respecter les opinions des autres et maintenir un ton professionnel même en désaccord.`,
-      `✨ La politesse crée un environnement de travail agréable et favorise la collaboration. Un simple sourire et des mots courtois font toute la différence.`
-    ];
-    return responses[Math.floor(Math.random() * responses.length)];
-  }
-
-  /**
-   * Génère une réponse sur le travail
-   */
-  generateResponseAboutWork(message, context) {
-    const responses = [
-      `💼 Le travail est plus qu'une activité, c'est un lieu d'épanouissement et de contribution. L'équilibre entre performance et bien-être est essentiel.`,
-      `👥 Un bon environnement de travail favorise la créativité, la collaboration et la satisfaction personnelle.`,
-      `🎯 Le travail devient plus motivant quand il a du sens, qu'il permet d'apprendre et qu'il est reconnu à sa juste valeur.`
-    ];
-    return responses[Math.floor(Math.random() * responses.length)];
-  }
-
-  /**
-   * Génère une réponse sur la météo
-   */
-  generateResponseAboutWeather(message, context) {
-    const responses = [
-      `🌤️ La météo influence souvent notre humeur et notre énergie. C'est fascinant comment la nature peut impacter notre quotidien !`,
-      `☀️ Le temps qu'il fait peut affecter notre productivité et notre bien-être. C'est important de s'adapter et de rester positif.`,
-      `🌧️ Même par mauvais temps, on peut trouver des aspects positifs et des opportunités de créativité ou de réflexion.`
-    ];
-    return responses[Math.floor(Math.random() * responses.length)];
-  }
-
-  /**
-   * Génère une réponse sur la santé
-   */
-  generateResponseAboutHealth(message, context) {
-    const responses = [
-      `🏥 La santé est notre bien le plus précieux. Il est important d'écouter son corps et de prendre soin de soi.`,
-      `💪 Prendre soin de sa santé physique et mentale améliore non seulement votre bien-être personnel mais aussi votre performance au travail.`,
-      `🤗 Si vous ne vous sentez pas bien, n'hésitez pas à consulter un professionnel de santé. Votre bien-être est prioritaire.`
-    ];
-    return responses[Math.floor(Math.random() * responses.length)];
-  }
-
-  /**
-   * Génère une réponse sur la technologie
-   */
-  generateResponseAboutTechnology(message, context) {
-    const responses = [
-      `🤖 La technologie évolue rapidement et transforme notre façon de travailler. C'est passionnant de voir les innovations qui nous aident au quotidien !`,
-      `💻 Les nouvelles technologies offrent des opportunités incroyables, mais il est important de les utiliser de manière équilibrée et éthique.`,
-      `⚡ La technologie peut être un formidable outil d'amélioration de la productivité et de la collaboration en entreprise.`
-    ];
-    return responses[Math.floor(Math.random() * responses.length)];
-  }
-
-  /**
-   * Génère une réponse sur la nourriture
-   */
-  generateResponseAboutFood(message, context) {
-    const responses = [
-      `🍽️ La nourriture est un plaisir de la vie et un moment de partage. C'est merveilleux de découvrir de nouvelles saveurs et cultures !`,
-      `😋 Manger ensemble renforce les liens sociaux et peut créer de beaux moments de convivialité en équipe.`,
-      `🍴 La cuisine est un art qui rassemble les gens. C'est un excellent sujet de conversation et de découverte mutuelle !`
-    ];
-    return responses[Math.floor(Math.random() * responses.length)];
-  }
-
-  /**
-   * Génère une réponse aux questions directes
-   */
-  generateResponseToDirectQuestion(message, context) {
-    const responses = [
-      `🤔 C'est une excellente question ! Laissez-moi réfléchir à cela...`,
-      `💭 C'est intéressant ! Voici ce que je pense à ce sujet...`,
-      `🤖 Excellente question ! Permettez-moi de vous donner mon point de vue...`,
-      `😊 C'est une question pertinente ! Voici mon analyse...`
-    ];
-    return responses[Math.floor(Math.random() * responses.length)];
-  }
-
-  /**
-   * Vérifie si c'est une question directe à l'IA
-   */
-  isDirectQuestionToAI(message) {
-    const directQuestions = [
-      'que penses-tu', 'qu\'en penses-tu', 'ton avis', 'que dis-tu',
-      'que pense l\'ia', 'l\'ia peut', 'peux-tu', 'peux tu',
-      'est-ce que tu peux', 'est ce que tu peux', 'peut-on', 'peut on',
-      'comment faire', 'que faire', 'aide-moi', 'aide moi',
-      'peux-tu m\'aider', 'peux tu m aider', 'comment', 'pourquoi',
-      'quand', 'où', 'qui', 'quoi'
-    ];
-    
-    const messageLower = message.toLowerCase();
-    return directQuestions.some(question => messageLower.includes(question));
-  }
-
-  /**
-   * Génère une réponse directe de l'IA
-   */
-  generateDirectAIResponse(message, context, sentiment, topic) {
-    const isPrivate = !context.isGroup;
-    const author = context.author || 'Utilisateur';
-    const messageLower = message.toLowerCase();
-    
-    // Réponses pour les questions sur le travail et l'entreprise
-    if (messageLower.includes('travail') || messageLower.includes('entreprise') || messageLower.includes('bureau')) {
-      const workResponses = [
-        `💼 ${isPrivate ? 'Voici mon avis' : 'Voici ce que je pense'} sur le travail : L'équipe et la communication sont essentielles !`,
-        `👥 ${isPrivate ? 'Pour le travail' : 'Au travail'}, je recommande la collaboration et l'entraide entre collègues.`,
-        `💪 ${isPrivate ? 'Mon conseil' : 'Mon avis'} : Un bon environnement de travail favorise la productivité !`,
-        `😊 ${isPrivate ? 'Je pense que' : 'Selon moi'}, le respect mutuel et la communication sont la clé du succès !`
-      ];
-      return workResponses[Math.floor(Math.random() * workResponses.length)];
+  async setEmployeeCustomHours(employeeId, startTime, endTime, lateThreshold) {
+    try {
+      const db = require('../config/database');
+      
+      await db.query(
+        'UPDATE employees SET custom_start_time = ?, custom_end_time = ?, custom_late_threshold = ?, updated_at = NOW() WHERE id = ?',
+        [startTime, endTime, lateThreshold, employeeId]
+      );
+      
+      console.log(`✅ Heures personnalisées définies pour l'employé ${employeeId}: ${startTime} - ${endTime} (seuil: ${lateThreshold}min)`);
+      return true;
+    } catch (error) {
+      console.error('Erreur lors de la définition des heures personnalisées:', error);
+      return false;
     }
-    
-    // Réponses pour les questions sur la politesse et la communication
-    if (messageLower.includes('poliment') || messageLower.includes('politesse') || messageLower.includes('respect')) {
-      const politenessResponses = [
-        `😊 ${isPrivate ? 'Voici mes conseils' : 'Voici mes recommandations'} pour être poli en entreprise :`,
-        `🤝 ${isPrivate ? 'Pour être respectueux' : 'Pour le respect'}, utilisez "s'il vous plaît", "merci", et "bonjour" !`,
-        `💬 ${isPrivate ? 'Mon avis' : 'Je recommande'} : Écoutez activement et soyez patient avec vos collègues.`,
-        `✨ ${isPrivate ? 'Conseil' : 'Astuce'} : Un sourire et une attitude positive font toute la différence !`
-      ];
-      return politenessResponses[Math.floor(Math.random() * politenessResponses.length)];
-    }
-    
-    // Réponses pour les questions sur les employés
-    if (messageLower.includes('employé') || messageLower.includes('collègue') || messageLower.includes('équipe')) {
-      const employeeResponses = [
-        `👥 ${isPrivate ? 'Concernant les employés' : 'Pour l\'équipe'}, je pense que chaque personne a ses forces !`,
-        `🤝 ${isPrivate ? 'Mon avis' : 'Je crois'} que la diversité des talents enrichit l'équipe.`,
-        `💪 ${isPrivate ? 'Concernant l\'équipe' : 'Pour les collègues'}, la collaboration est la clé du succès !`,
-        `😊 ${isPrivate ? 'Je pense que' : 'Selon moi'}, chaque membre apporte une valeur unique !`
-      ];
-      return employeeResponses[Math.floor(Math.random() * employeeResponses.length)];
-    }
-    
-    // Réponses pour les questions sur les actions du groupe
-    if (messageLower.includes('action') || messageLower.includes('faire') || messageLower.includes('décision')) {
-      const actionResponses = [
-        `🎯 ${isPrivate ? 'Pour les actions' : 'Concernant les décisions'}, je recommande la réflexion collective !`,
-        `💡 ${isPrivate ? 'Mon conseil' : 'Mon avis'} : Analyser les options avant de décider est important.`,
-        `🤔 ${isPrivate ? 'Je pense que' : 'Selon moi'}, il faut peser le pour et le contre ensemble.`,
-        `✨ ${isPrivate ? 'Conseil' : 'Recommandation'} : La communication transparente évite les malentendus !`
-      ];
-      return actionResponses[Math.floor(Math.random() * actionResponses.length)];
-    }
-    
-    // Réponses génériques pour les questions directes
-    const genericDirectResponses = [
-      `🤖 ${isPrivate ? 'Excellente question' : 'Bonne question'} ! Laissez-moi réfléchir...`,
-      `💭 ${isPrivate ? 'C\'est intéressant' : 'C\'est une bonne question'} ! Voici ce que je pense :`,
-      `😊 ${isPrivate ? 'Je vais vous donner' : 'Je vais donner'} mon avis sur ce sujet :`,
-      `✨ ${isPrivate ? 'Mon point de vue' : 'Mon opinion'} sur cette question :`
-    ];
-    
-    return genericDirectResponses[Math.floor(Math.random() * genericDirectResponses.length)];
   }
 
   /**
-   * Analyse le sentiment du message
+   * Récupère les heures personnalisées d'un employé
    */
-  analyzeSentiment(message) {
-    const positiveWords = ['bien', 'super', 'génial', 'excellent', 'parfait', 'content', 'heureux', 'joie'];
-    const negativeWords = ['difficile', 'dur', 'problème', 'souci', 'fatigué', 'stressé', 'triste', 'mal'];
-    const neutralWords = ['ok', 'normal', 'correct', 'moyen', 'comme ci comme ça'];
-    
-    const messageLower = message.toLowerCase();
-    
-    const positiveCount = positiveWords.filter(word => messageLower.includes(word)).length;
-    const negativeCount = negativeWords.filter(word => messageLower.includes(word)).length;
-    const neutralCount = neutralWords.filter(word => messageLower.includes(word)).length;
-    
-    if (positiveCount > negativeCount && positiveCount > neutralCount) return 'positive';
-    if (negativeCount > positiveCount && negativeCount > neutralCount) return 'negative';
-    return 'neutral';
-  }
-
-  /**
-   * Identifie le sujet principal du message
-   */
-  identifyTopic(message) {
-    const topics = {
-      work: ['travail', 'bureau', 'projet', 'réunion', 'collègue', 'patron', 'équipe'],
-      personal: ['famille', 'ami', 'weekend', 'vacances', 'loisir', 'hobby', 'sport'],
-      weather: ['météo', 'temps', 'pluie', 'soleil', 'chaud', 'froid', 'nuage'],
-      technology: ['ordinateur', 'téléphone', 'internet', 'app', 'logiciel', 'technologie'],
-      health: ['santé', 'malade', 'médecin', 'hôpital', 'médicament', 'fatigue'],
-      food: ['manger', 'repas', 'restaurant', 'cuisine', 'nourriture', 'boire']
-    };
-    
-    const messageLower = message.toLowerCase();
-    
-    for (const [topic, keywords] of Object.entries(topics)) {
-      if (keywords.some(keyword => messageLower.includes(keyword))) {
-        return topic;
+  async getEmployeeCustomHours(employeeId) {
+    try {
+      const db = require('../config/database');
+      
+      const result = await db.query(
+        'SELECT custom_start_time, custom_end_time, custom_late_threshold FROM employees WHERE id = ?',
+        [employeeId]
+      );
+      
+      if (result.length > 0) {
+        return {
+          startTime: result[0].custom_start_time,
+          endTime: result[0].custom_end_time,
+          lateThreshold: result[0].custom_late_threshold
+        };
       }
+      
+      return null;
+    } catch (error) {
+      console.error('Erreur lors de la récupération des heures personnalisées:', error);
+      return null;
     }
-    
-    return 'general';
   }
 
   /**
-   * Génère une réponse contextuelle intelligente
+   * Supprime les heures personnalisées d'un employé (retour aux heures par défaut)
    */
-  generateContextualResponse(message, context, sentiment, topic) {
-    const isPrivate = !context.isGroup;
-    const author = context.author || 'Utilisateur';
-    const messageLower = message.toLowerCase();
-    
-    // Réponses basées sur le sentiment
-    if (sentiment === 'positive') {
-      const positiveResponses = [
-        `😊 C'est génial ! Je suis content que ça aille bien pour toi !`,
-        `😄 Super ! Ça me fait plaisir d'entendre ça !`,
-        `😊 Excellent ! Continue comme ça !`,
-        `😄 Parfait ! Tu as l'air en pleine forme !`
-      ];
-      return positiveResponses[Math.floor(Math.random() * positiveResponses.length)];
-    }
-    
-    if (sentiment === 'negative') {
-      const supportiveResponses = [
-        `😔 Je comprends que ce soit difficile. Veux-tu en parler ?`,
-        `🤗 Je suis là pour t'écouter si tu veux partager ce qui ne va pas.`,
-        `😊 Courage ! Les moments difficiles passent toujours.`,
-        `💪 Tu es plus fort que tu ne le penses ! N'hésite pas si tu as besoin de parler.`
-      ];
-      return supportiveResponses[Math.floor(Math.random() * supportiveResponses.length)];
-    }
-    
-    // Réponses basées sur le sujet
-    switch (topic) {
-      case 'work':
-        const workResponses = [
-          `💼 Le travail, c'est important ! Comment ça se passe ?`,
-          `👥 L'équipe, c'est la clé du succès ! Raconte-moi !`,
-          `💪 Le travail d'équipe, c'est génial ! Comment ça avance ?`,
-          `😊 Le boulot, c'est du sérieux ! Dis-moi tout !`
-        ];
-        return workResponses[Math.floor(Math.random() * workResponses.length)];
-        
-      case 'personal':
-        const personalResponses = [
-          `😊 C'est chouette ! Raconte-moi en plus !`,
-          `😄 J'adore entendre parler de la vie personnelle ! Continue !`,
-          `😊 C'est important de prendre du temps pour soi !`,
-          `😄 La vie privée, c'est précieux ! Dis-moi tout !`
-        ];
-        return personalResponses[Math.floor(Math.random() * personalResponses.length)];
-        
-      case 'weather':
-        const weatherResponses = [
-          `🌤️ La météo, c'est capricieux ! Qu'est-ce que tu en penses ?`,
-          `☀️ Le temps, ça influence l'humeur ! Comment tu le vis ?`,
-          `🌧️ Même par mauvais temps, on peut avoir de bonnes journées !`,
-          `🌤️ Le temps, c'est relatif ! L'important c'est l'ambiance !`
-        ];
-        return weatherResponses[Math.floor(Math.random() * weatherResponses.length)];
-        
-      case 'technology':
-        const techResponses = [
-          `🤖 La technologie, c'est fascinant ! Qu'est-ce qui t'intéresse ?`,
-          `💻 Les nouvelles tech, c'est passionnant ! Raconte-moi !`,
-          `📱 L'innovation, c'est génial ! Comment tu vois ça ?`,
-          `🔧 La tech, c'est l'avenir ! Dis-moi tout !`
-        ];
-        return techResponses[Math.floor(Math.random() * techResponses.length)];
-        
-      case 'health':
-        const healthResponses = [
-          `🏥 La santé, c'est le plus important ! Comment tu te sens ?`,
-          `💊 Prends soin de toi ! C'est primordial !`,
-          `😊 La santé, c'est précieux ! Écoute ton corps !`,
-          `🤗 Je suis là si tu as besoin de parler de ça !`
-        ];
-        return healthResponses[Math.floor(Math.random() * healthResponses.length)];
-        
-      case 'food':
-        const foodResponses = [
-          `🍽️ La nourriture, c'est la vie ! Qu'est-ce que tu aimes ?`,
-          `😋 Manger, c'est un plaisir ! Raconte-moi !`,
-          `🍴 La cuisine, c'est un art ! Comment tu vois ça ?`,
-          `😊 La gastronomie, c'est culturel ! Dis-moi tout !`
-        ];
-        return foodResponses[Math.floor(Math.random() * foodResponses.length)];
-        
-      default:
-        // Réponses génériques intelligentes
-        const genericResponses = [
-          `😊 C'est intéressant ! Dis-moi en plus !`,
-          `😄 Ah oui ? Raconte-moi !`,
-          `😊 Je vois ! Et alors ?`,
-          `😄 Intéressant ! Qu'est-ce que tu en penses ?`,
-          `😊 C'est cool ! Continue !`,
-          `😄 J'aime bien discuter avec toi !`,
-          `😊 Tu as l'air de bien connaître ça !`,
-          `😄 C'est passionnant ! Dis-moi plus !`
-        ];
-        return genericResponses[Math.floor(Math.random() * genericResponses.length)];
+  async removeEmployeeCustomHours(employeeId) {
+    try {
+      const db = require('../config/database');
+      
+      await db.query(
+        'UPDATE employees SET custom_start_time = NULL, custom_end_time = NULL, custom_late_threshold = NULL, updated_at = NOW() WHERE id = ?',
+        [employeeId]
+      );
+      
+      console.log(`✅ Heures personnalisées supprimées pour l'employé ${employeeId} - retour aux heures par défaut`);
+      return true;
+    } catch (error) {
+      console.error('Erreur lors de la suppression des heures personnalisées:', error);
+      return false;
     }
   }
-
 
   /**
    * Traite un message avec l'IA et exécute l'action appropriée
@@ -1520,10 +2065,26 @@ Que veux-tu faire ? 😊`;
     try {
       const context = {
         author: contact.name || contact.number,
-        chatId: chat?.id?._serialized || contact?.id?._serialized || 'unknown',
+        chatId: chat?.id?._serialized || contact?.id?._serialized || contact?.number || 'unknown',
         isGroup: chat?.isGroup || false,
-        timestamp: new Date()
+        timestamp: new Date(),
+        userPhone: contact.number,
+        contactNumber: contact.number
       };
+
+      console.log(`🔍 Contexte créé - chatId: ${context.chatId}, isGroup: ${context.isGroup}`);
+
+      // Vérifier si c'est une justification de retard
+      const isJustification = await this.isLateArrivalJustification(contact, message);
+      if (isJustification) {
+        console.log(`📝 Justification de retard détectée`);
+        await this.processLateArrivalJustification(contact, message, context);
+        return {
+          analysis: { type: 'late_justification', action: 'process_justification', confidence: 1.0 },
+          response: `✅ Justification reçue et enregistrée. Merci !`,
+          shouldProcess: true
+        };
+      }
 
       // Analyser le message
       const analysis = await this.analyzeMessage(message, context);
@@ -1556,6 +2117,9 @@ Que veux-tu faire ? 😊`;
       const isPrivateChat = context && !context.isGroup;
       const isAttendance = analysis.type === 'attendance';
       
+      // Vérifier si le bot est mentionné dans le message
+      const isBotMentioned = this.isBotMentioned(message);
+      
       let effectiveThreshold;
       if (isFreeChat) {
         effectiveThreshold = 0.1;
@@ -1567,6 +2131,27 @@ Que veux-tu faire ? 😊`;
         effectiveThreshold = 0.1;
       } else {
         effectiveThreshold = this.confidenceThreshold;
+      }
+      
+      // Dans les groupes, être très strict si le bot n'est pas mentionné
+      if (context && context.isGroup && !isBotMentioned) {
+        // Seulement les fonctions importantes (présence, permissions, admin) sans mention
+        const isImportantFunction = analysis.type === 'attendance' || 
+                                   analysis.type === 'permission' || 
+                                   analysis.type === 'admin_command';
+        
+        if (!isImportantFunction) {
+          return {
+            analysis,
+            response: null,
+            shouldProcess: false
+          };
+        }
+      } else if (context && context.isGroup && isBotMentioned) {
+        // Si le bot est mentionné dans un groupe, permettre les conversations libres
+        if (analysis.type === 'free_chat' || analysis.type === 'mention') {
+          analysis.action = 'free_chat';
+        }
       }
       
       return {
@@ -1582,6 +2167,154 @@ Que veux-tu faire ? 😊`;
         response: null,
         shouldProcess: false
       };
+    }
+  }
+
+  /**
+   * Vérifie si l'arrivée est en retard
+   */
+  async checkIfLateArrival(employee) {
+    try {
+      const db = require('../config/database');
+      const moment = require('moment');
+      
+      // Récupérer les paramètres personnalisés de l'employé
+      const employeeData = await db.query(
+        'SELECT custom_start_time, custom_late_threshold FROM employees WHERE id = ? OR phone = ?',
+        [employee.id, employee.phone]
+      );
+      
+      let startTime, threshold;
+      
+      if (employeeData.length > 0 && employeeData[0].custom_start_time) {
+        // Utiliser les heures personnalisées de l'employé
+        startTime = employeeData[0].custom_start_time;
+        threshold = employeeData[0].custom_late_threshold || 15;
+        console.log(`📅 Heures personnalisées pour ${employee.name}: ${startTime} (seuil: ${threshold}min)`);
+      } else {
+        // Utiliser les paramètres par défaut de l'entreprise
+        const workStartTime = await db.query('SELECT setting_value FROM system_settings WHERE setting_key = ?', ['work_start_time']);
+        const lateThreshold = await db.query('SELECT setting_value FROM system_settings WHERE setting_key = ?', ['late_threshold_minutes']);
+        
+        startTime = workStartTime[0]?.setting_value || '08:00';
+        threshold = parseInt(lateThreshold[0]?.setting_value || '15');
+        console.log(`📅 Heures par défaut pour ${employee.name}: ${startTime} (seuil: ${threshold}min)`);
+      }
+      
+      const currentTime = moment();
+      const expectedStartTime = moment(startTime, 'HH:mm');
+      const lateThresholdTime = expectedStartTime.add(threshold, 'minutes');
+      
+      const isLate = currentTime.isAfter(lateThresholdTime);
+      
+      if (isLate) {
+        const delayMinutes = currentTime.diff(expectedStartTime, 'minutes');
+        console.log(`⚠️ Retard détecté: ${delayMinutes} minutes de retard`);
+      }
+      
+      return isLate;
+    } catch (error) {
+      console.error('Erreur lors de la vérification du retard:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Demande une justification pour le retard
+   */
+  async requestLateArrivalJustification(employee, context) {
+    try {
+      const WhatsAppBot = require('./whatsappBot');
+      const currentTime = new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+      
+      const message = `⚠️ RETARD DÉTECTÉ - ${currentTime}\n\n` +
+        `Bonjour ${employee.name},\n\n` +
+        `Je remarque que vous arrivez en retard aujourd'hui. Pourriez-vous me donner une justification pour ce retard ?\n\n` +
+        `💡 Répondez simplement avec la raison de votre retard (ex: "Problème de transport", "Rendez-vous médical", etc.)`;
+      
+      await WhatsAppBot.sendAIMessage(employee.phone + '@c.us', message);
+      console.log(`📱 Demande de justification envoyée à ${employee.name}`);
+      
+      // Marquer que nous attendons une justification
+      await this.markWaitingForJustification(employee.id);
+      
+    } catch (error) {
+      console.error('Erreur lors de l\'envoi de la demande de justification:', error);
+    }
+  }
+
+  /**
+   * Marque qu'on attend une justification de l'employé
+   */
+  async markWaitingForJustification(employeeId) {
+    try {
+      const db = require('../config/database');
+      const today = moment().format('YYYY-MM-DD');
+      
+      // Mettre à jour la présence pour indiquer qu'on attend une justification
+      await db.query(
+        'UPDATE attendance SET notes = ?, updated_at = NOW() WHERE employee_id = ? AND date = ?',
+        ['En attente de justification du retard', employeeId, today]
+      );
+      
+    } catch (error) {
+      console.error('Erreur lors du marquage de l\'attente de justification:', error);
+    }
+  }
+
+  /**
+   * Traite une justification de retard reçue
+   */
+  async processLateArrivalJustification(employee, justification, context) {
+    try {
+      const db = require('../config/database');
+      const today = moment().format('YYYY-MM-DD');
+      
+      // Mettre à jour la présence avec la justification
+      await db.query(
+        'UPDATE attendance SET notes = ?, updated_at = NOW() WHERE employee_id = ? AND date = ?',
+        [`Arrivée en retard - Justification: ${justification}`, employee.id, today]
+      );
+      
+      // Envoyer un accusé de réception
+      const WhatsAppBot = require('./whatsappBot');
+      const message = `✅ Justification reçue\n\n` +
+        `Merci ${employee.name} pour votre justification :\n"${justification}"\n\n` +
+        `Votre retard a été enregistré avec cette justification.`;
+      
+      await WhatsAppBot.sendAIMessage(employee.phone + '@c.us', message);
+      console.log(`📱 Justification traitée pour ${employee.name}: ${justification}`);
+      
+      // Notifier l'admin si nécessaire
+      await this.notifyAdminLateJustification(employee, justification);
+      
+    } catch (error) {
+      console.error('Erreur lors du traitement de la justification:', error);
+    }
+  }
+
+  /**
+   * Notifie l'admin de la justification de retard
+   */
+  async notifyAdminLateJustification(employee, justification) {
+    try {
+      const adminPhone = process.env.ADMIN_PHONE;
+      if (!adminPhone) return;
+      
+      const WhatsAppBot = require('./whatsappBot');
+      const currentTime = new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+      
+      const message = `📋 JUSTIFICATION DE RETARD REÇUE - ${currentTime}\n\n` +
+        `👤 Employé: ${employee.name}\n` +
+        `📞 Téléphone: ${employee.phone}\n` +
+        `📝 Justification: "${justification}"\n\n` +
+        `✅ La justification a été enregistrée en base de données.`;
+      
+      await WhatsAppBot.sendAIMessage(adminPhone, message);
+      console.log(`📱 Notification admin envoyée pour la justification de ${employee.name}`);
+      
+    } catch (error) {
+      console.error('Erreur lors de la notification admin:', error);
     }
   }
 
@@ -1623,11 +2356,78 @@ Que veux-tu faire ? 😊`;
       let status = 'present';
       let notes = '';
       
+      // Vérifier si la même action a déjà été effectuée aujourd'hui
+      if (existingAttendance.length > 0) {
+        const attendance = existingAttendance[0];
+        
+        // Vérifier les doublons selon l'action
+        switch (action) {
+          case 'arrival':
+            if (attendance.arrival_time) {
+              console.log(`⚠️ ${employee.name} a déjà marqué son arrivée aujourd'hui à ${attendance.arrival_time}`);
+              return { 
+                error: 'duplicate', 
+                message: `Vous avez déjà marqué votre arrivée aujourd'hui à ${attendance.arrival_time}. Pour modifier, contactez l'administrateur.`,
+                existingTime: attendance.arrival_time
+              };
+            }
+            break;
+          case 'departure':
+            if (attendance.departure_time) {
+              console.log(`⚠️ ${employee.name} a déjà marqué son départ aujourd'hui à ${attendance.departure_time}`);
+              return { 
+                error: 'duplicate', 
+                message: `Vous avez déjà marqué votre départ aujourd'hui à ${attendance.departure_time}. Pour modifier, contactez l'administrateur.`,
+                existingTime: attendance.departure_time
+              };
+            }
+            break;
+          case 'lunch_break':
+            if (attendance.lunch_start) {
+              console.log(`⚠️ ${employee.name} a déjà commencé sa pause déjeuner aujourd'hui à ${attendance.lunch_start}`);
+              return { 
+                error: 'duplicate', 
+                message: `Vous avez déjà commencé votre pause déjeuner aujourd'hui à ${attendance.lunch_start}. Pour modifier, contactez l'administrateur.`,
+                existingTime: attendance.lunch_start
+              };
+            }
+            break;
+          case 'lunch_return':
+            if (attendance.lunch_end) {
+              console.log(`⚠️ ${employee.name} a déjà terminé sa pause déjeuner aujourd'hui à ${attendance.lunch_end}`);
+              return { 
+                error: 'duplicate', 
+                message: `Vous avez déjà terminé votre pause déjeuner aujourd'hui à ${attendance.lunch_end}. Pour modifier, contactez l'administrateur.`,
+                existingTime: attendance.lunch_end
+              };
+            }
+            break;
+          case 'absence':
+          case 'mission':
+          case 'mission_return':
+          case 'remote_work':
+          case 'leave':
+            // Ces actions peuvent être marquées plusieurs fois dans la journée
+            break;
+        }
+      }
+      
       // Déterminer le statut selon l'action
       switch (action) {
         case 'arrival':
           status = 'present';
           notes = 'Arrivée enregistrée';
+          
+          // Vérifier si c'est un retard
+          const isLate = await this.checkIfLateArrival(employee);
+          if (isLate) {
+            console.log(`⚠️ Retard détecté pour ${employee.name}`);
+            notes = 'Arrivée en retard - Justification demandée';
+            status = 'late';
+            
+            // Demander une justification en message privé
+            await this.requestLateArrivalJustification(employee, context);
+          }
           break;
         case 'departure':
           status = 'present';
@@ -1670,6 +2470,9 @@ Que veux-tu faire ? 😊`;
             'UPDATE attendance SET arrival_time = ?, status = ?, notes = ?, updated_at = NOW() WHERE employee_id = ? AND date = ?',
             [currentTime, status, notes, employee.id, today]
           );
+          
+          // Retourner l'information sur le retard
+          return { isLate: status === 'late' };
         } else if (action === 'departure') {
           // Calculer les heures de travail
           const arrivalTime = moment(existingAttendance[0].arrival_time, 'HH:mm:ss');
@@ -1713,6 +2516,9 @@ Que veux-tu faire ? 😊`;
             'INSERT INTO attendance (employee_id, date, arrival_time, status, notes) VALUES (?, ?, ?, ?, ?)',
             [employee.id, today, currentTime, status, notes]
           );
+          
+          // Retourner l'information sur le retard
+          return { isLate: status === 'late' };
         } else {
           await db.query(
             'INSERT INTO attendance (employee_id, date, status, notes) VALUES (?, ?, ?, ?)',
@@ -1722,6 +2528,22 @@ Que veux-tu faire ? 😊`;
       }
       
       console.log(`✅ Présence enregistrée en base: ${action} pour ${employee.name}`);
+      
+      // Émettre un événement WebSocket pour notifier les clients
+      if (global.io) {
+        console.log(`🚀 ÉMISSION WEBSOCKET - Envoi de l'événement attendance_update pour ${action} de ${employee.name}`);
+        global.io.emit('attendance_update', {
+          type: action,
+          employee_id: employee.id,
+          employee_name: employee.name,
+          status: status,
+          timestamp: new Date().toISOString(),
+          notes: notes
+        });
+        console.log(`📡 Événement WebSocket "attendance_update" émis pour ${action}`);
+      } else {
+        console.log(`❌ global.io n'est pas disponible pour émettre l'événement attendance_update`);
+      }
       
       // Retourner les informations calculées pour le départ
       if (action === 'departure' && existingAttendance.length > 0) {
@@ -1807,6 +2629,54 @@ Que veux-tu faire ? 😊`;
     try {
       const messageLower = message.toLowerCase().trim();
       const isGroup = context.isGroup;
+      const author = context.author || 'Utilisateur';
+      
+      // Vérifier si l'utilisateur est un administrateur du groupe WhatsApp
+      if (!this.whatsappBot) {
+        return `❌ Bot WhatsApp non disponible. Contactez le développeur.`;
+      }
+      
+      // Créer un objet contact simulé pour la vérification
+      const phoneNumber = context.contactNumber || context.userPhone;
+      const contact = {
+        id: { _serialized: phoneNumber.includes('@') ? phoneNumber : `${phoneNumber}@c.us` },
+        name: author,
+        number: phoneNumber
+      };
+      
+      let isGroupAdmin = false;
+      
+      if (isGroup) {
+        // Pour les messages de groupe, récupérer le chat et vérifier le statut admin
+        try {
+          const chatId = context.chatId;
+          const chat = await this.whatsappBot.client.getChatById(chatId);
+          isGroupAdmin = await this.whatsappBot.isGroupAdmin(contact, chat);
+        } catch (error) {
+          console.error('Erreur lors de la vérification admin du groupe:', error);
+          return `❌ Erreur lors de la vérification des permissions.`;
+        }
+      } else {
+        // Pour les messages privés, vérifier si c'est un membre du groupe
+        try {
+          const isMember = await this.whatsappBot.isGroupMember(contact);
+          if (isMember) {
+            // Si c'est un membre, vérifier s'il est admin du groupe
+            const groupId = process.env.WHATSAPP_GROUP_ID;
+            if (groupId) {
+              const chat = await this.whatsappBot.client.getChatById(groupId);
+              isGroupAdmin = await this.whatsappBot.isGroupAdmin(contact, chat);
+            }
+          }
+        } catch (error) {
+          console.error('Erreur lors de la vérification admin pour message privé:', error);
+          return `❌ Erreur lors de la vérification des permissions.`;
+        }
+      }
+      
+      if (!isGroupAdmin) {
+        return `❌ Accès refusé. Seuls les administrateurs du groupe WhatsApp peuvent utiliser ces commandes.`;
+      }
       
       // Mapping des raccourcis vers les commandes complètes
       const commandMapping = {
@@ -2025,8 +2895,7 @@ Aucune présence enregistrée aujourd'hui.`;
           name,
           position,
           department,
-          phone_number,
-          email
+          phone
         FROM employees 
         ORDER BY name ASC
       `);
@@ -2043,11 +2912,8 @@ Aucun employé enregistré.`;
         response += `${index + 1}. **${employee.name}**\n`;
         response += `   📍 ${employee.position || 'Poste non défini'}\n`;
         response += `   🏢 ${employee.department || 'Département non défini'}\n`;
-        if (employee.phone_number) {
-          response += `   📱 ${employee.phone_number}\n`;
-        }
-        if (employee.email) {
-          response += `   📧 ${employee.email}\n`;
+        if (employee.phone) {
+          response += `   📱 ${employee.phone}\n`;
         }
         response += `\n`;
       });

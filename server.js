@@ -46,6 +46,8 @@ app.use('/api/admin', require('./routes/admin'));
 console.log('✅ Route /api/admin enregistrée');
 app.use('/api/ai', require('./routes/ai'));
 console.log('✅ Route /api/ai enregistrée');
+app.use('/api/employee-hours', require('./routes/employee-hours'));
+console.log('✅ Route /api/employee-hours enregistrée');
 try {
   console.log('📁 Chargement de la route departments...');
   const departmentsRoute = require('./routes/departments');
