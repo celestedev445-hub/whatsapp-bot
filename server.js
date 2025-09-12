@@ -2,11 +2,13 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const db = require('./config/database');
 const whatsappBot = require('./services/whatsappBot');
 const cronJobs = require('./services/cronJobs');
+const { authenticateToken } = require('./middleware/auth');
 
 const app = express();
 const PORT = 3002; // Force le port 3002
@@ -34,39 +36,43 @@ app.use((req, res, next) => {
 
 // Routes
 console.log('🔧 Enregistrement des routes...');
-app.use('/api/employees', require('./routes/employees'));
-console.log('✅ Route /api/employees enregistrée');
-app.use('/api/attendance', require('./routes/attendance'));
-console.log('✅ Route /api/attendance enregistrée');
-app.use('/api/permissions', require('./routes/permissions'));
-console.log('✅ Route /api/permissions enregistrée');
-app.use('/api/reports', require('./routes/reports'));
-console.log('✅ Route /api/reports enregistrée');
-app.use('/api/admin', require('./routes/admin'));
-console.log('✅ Route /api/admin enregistrée');
-app.use('/api/ai', require('./routes/ai'));
-console.log('✅ Route /api/ai enregistrée');
-app.use('/api/employee-hours', require('./routes/employee-hours'));
-console.log('✅ Route /api/employee-hours enregistrée');
+
+// Route d'authentification (sans protection)
+app.use('/api/auth', require('./routes/auth'));
+console.log('✅ Route /api/auth enregistrée');
+
+// Routes protégées par authentification
+app.use('/api/employees', authenticateToken, require('./routes/employees'));
+console.log('✅ Route /api/employees enregistrée (protégée)');
+app.use('/api/attendance', authenticateToken, require('./routes/attendance'));
+console.log('✅ Route /api/attendance enregistrée (protégée)');
+app.use('/api/permissions', authenticateToken, require('./routes/permissions'));
+console.log('✅ Route /api/permissions enregistrée (protégée)');
+app.use('/api/reports', authenticateToken, require('./routes/reports'));
+console.log('✅ Route /api/reports enregistrée (protégée)');
+app.use('/api/admin', authenticateToken, require('./routes/admin'));
+console.log('✅ Route /api/admin enregistrée (protégée)');
+app.use('/api/ai', authenticateToken, require('./routes/ai'));
+console.log('✅ Route /api/ai enregistrée (protégée)');
+app.use('/api/employee-hours', authenticateToken, require('./routes/employee-hours'));
+console.log('✅ Route /api/employee-hours enregistrée (protégée)');
 try {
   console.log('📁 Chargement de la route departments...');
   const departmentsRoute = require('./routes/departments');
-  app.use('/api/departments', departmentsRoute);
-  console.log('✅ Route /api/departments enregistrée');
+  app.use('/api/departments', authenticateToken, departmentsRoute);
+  console.log('✅ Route /api/departments enregistrée (protégée)');
 } catch (error) {
   console.error('❌ Erreur lors du chargement de la route departments:', error.message);
   console.error('Stack trace:', error.stack);
 }
-app.use('/api/messages', require('./routes/messages'));
-console.log('✅ Route /api/messages enregistrée');
-app.use('/api/ai', require('./routes/ai'));
-console.log('✅ Route /api/ai enregistrée');
+app.use('/api/messages', authenticateToken, require('./routes/messages'));
+console.log('✅ Route /api/messages enregistrée (protégée)');
 
 // Route de santé
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
-    message: 'Bot WhatsApp Entreprise - En ligne',
+    message: 'Promillys Bot - En ligne',
     timestamp: new Date().toISOString()
   });
 });
@@ -101,10 +107,11 @@ app.post('/api/admin/init-bot', async (req, res) => {
 // Route racine
 app.get('/', (req, res) => {
   res.json({
-    message: 'Bot WhatsApp Entreprise',
+    message: 'Promillys Bot',
     version: '1.0.0',
     endpoints: {
       health: '/health',
+      auth: '/api/auth',
       employees: '/api/employees',
       attendance: '/api/attendance',
       permissions: '/api/permissions',
@@ -145,9 +152,9 @@ async function startServer() {
     
     // Démarrage du serveur
     app.listen(PORT, () => {
-      console.log(`🚀 Serveur démarré sur le port ${PORT}`);
-      console.log(`📱 Bot WhatsApp Entreprise - Prêt à fonctionner`);
-      console.log(`🌐 Interface web: http://localhost:${PORT}`);
+    console.log(`🚀 Serveur démarré sur le port ${PORT}`);
+    console.log(`📱 Promillys Bot - Prêt à fonctionner`);
+    console.log(`🌐 Interface web: http://localhost:${PORT}`);
     });
     
   } catch (error) {

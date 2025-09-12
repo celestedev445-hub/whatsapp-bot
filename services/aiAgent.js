@@ -1978,10 +1978,20 @@ Dis-moi ce qui t'intéresse ou ce qui te préoccupe, je serai ravi d'en discuter
       const db = require('../config/database');
       const today = moment().format('YYYY-MM-DD');
       
+      // Récupérer l'ID de l'employé via le numéro de téléphone
+      const employee = await db.query(
+        'SELECT id FROM employees WHERE phone = ? AND is_active = 1',
+        [contact.number]
+      );
+      
+      if (employee.length === 0) {
+        return false;
+      }
+      
       // Vérifier si l'employé a une présence en attente de justification
       const attendance = await db.query(
         'SELECT * FROM attendance WHERE employee_id = ? AND date = ? AND notes LIKE ?',
-        [contact.number, today, '%En attente de justification%']
+        [employee[0].id, today, '%En attente de justification%']
       );
       
       return attendance.length > 0;
@@ -2078,7 +2088,17 @@ Dis-moi ce qui t'intéresse ou ce qui te préoccupe, je serai ravi d'en discuter
       const isJustification = await this.isLateArrivalJustification(contact, message);
       if (isJustification) {
         console.log(`📝 Justification de retard détectée`);
-        await this.processLateArrivalJustification(contact, message, context);
+        
+        // Récupérer les informations de l'employé
+        const employee = await db.query(
+          'SELECT * FROM employees WHERE phone = ? AND is_active = 1',
+          [contact.number]
+        );
+        
+        if (employee.length > 0) {
+          await this.processLateArrivalJustification(employee[0], message, context);
+        }
+        
         return {
           analysis: { type: 'late_justification', action: 'process_justification', confidence: 1.0 },
           response: `✅ Justification reçue et enregistrée. Merci !`,
@@ -2270,11 +2290,14 @@ Dis-moi ce qui t'intéresse ou ce qui te préoccupe, je serai ravi d'en discuter
       const db = require('../config/database');
       const today = moment().format('YYYY-MM-DD');
       
-      // Mettre à jour la présence avec la justification
+      // Mettre à jour la présence avec la justification et changer le statut
       await db.query(
-        'UPDATE attendance SET notes = ?, updated_at = NOW() WHERE employee_id = ? AND date = ?',
-        [`Arrivée en retard - Justification: ${justification}`, employee.id, today]
+        'UPDATE attendance SET notes = ?, status = ?, updated_at = NOW() WHERE employee_id = ? AND date = ?',
+        [`Arrivée en retard - Justification: ${justification}`, 'late_justified', employee.id, today]
       );
+      
+      console.log(`📝 Justification enregistrée pour ${employee.name}: "${justification}"`);
+      console.log(`📊 Statut mis à jour: late → late_justified`);
       
       // Envoyer un accusé de réception
       const WhatsAppBot = require('./whatsappBot');

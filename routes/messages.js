@@ -179,4 +179,82 @@ router.post('/send', async (req, res) => {
   }
 });
 
+// POST /api/messages/send-to-department - Envoyer un message à un département
+router.post('/send-to-department', async (req, res) => {
+  try {
+    const { content, department_id, message_type = 'text' } = req.body;
+    
+    if (!content || content.trim() === '') {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Le contenu du message est requis' 
+      });
+    }
+
+    if (!department_id) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'L\'ID du département est requis' 
+      });
+    }
+
+    // Récupérer les employés du département
+    const employees = await db.query(`
+      SELECT id, name, phone, department_id
+      FROM employees 
+      WHERE department_id = ? AND is_active = 1
+    `, [department_id]);
+
+    if (employees.length === 0) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Aucun employé actif trouvé dans ce département' 
+      });
+    }
+
+    // Récupérer le nom du département
+    const department = await db.query(`
+      SELECT name FROM departments WHERE id = ?
+    `, [department_id]);
+
+    const departmentName = department[0]?.name || 'Département';
+
+    // Insérer le message pour chaque employé du département
+    const messageContent = `[Message du département ${departmentName}]\n\n${content.trim()}`;
+    const groupId = process.env.WHATSAPP_GROUP_ID;
+    
+    const results = [];
+    for (const employee of employees) {
+      const result = await db.query(`
+        INSERT INTO messages (group_id, from_number, content, message_type, created_at, employee_id)
+        VALUES (?, ?, ?, ?, NOW(), ?)
+      `, [groupId, 'system', messageContent, message_type, employee.id]);
+      
+      results.push({
+        employee_id: employee.id,
+        employee_name: employee.name,
+        message_id: result.insertId
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Message envoyé à ${employees.length} employé(s) du département ${departmentName}`,
+      data: {
+        department_name: departmentName,
+        employees_count: employees.length,
+        messages_sent: results
+      }
+    });
+
+  } catch (error) {
+    console.error('Erreur lors de l\'envoi du message au département:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Erreur lors de l\'envoi du message au département',
+      details: error.message 
+    });
+  }
+});
+
 module.exports = router;

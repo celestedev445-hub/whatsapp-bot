@@ -41,6 +41,7 @@ router.get('/all', async (req, res) => {
       SELECT 
         e.*,
         d.name as department_name,
+        d.id as department_id,
         COUNT(a.id) as total_attendance_days,
         COUNT(CASE WHEN a.status = 'present' THEN 1 END) as present_days,
         COUNT(CASE WHEN a.status = 'late' THEN 1 END) as late_days,
@@ -62,6 +63,7 @@ router.get('/all', async (req, res) => {
   }
 });
 
+
 // GET /api/employees/:id - Récupérer un employé spécifique
 router.get('/:id', async (req, res) => {
   try {
@@ -74,7 +76,7 @@ router.get('/:id', async (req, res) => {
         d.id as department_id
       FROM employees e
       LEFT JOIN departments d ON e.department_id = d.id
-      WHERE e.id = ? AND e.is_active = 1
+      WHERE e.id = ?
     `, [id]);
     
     if (employee.length === 0) {
@@ -91,6 +93,7 @@ router.get('/:id', async (req, res) => {
         COUNT(CASE WHEN status = 'present' THEN 1 END) as present_days,
         COUNT(CASE WHEN status = 'late' THEN 1 END) as late_days,
         COUNT(CASE WHEN status = 'absent' THEN 1 END) as absent_days,
+        COUNT(CASE WHEN status = 'permission' THEN 1 END) as permission_days,
         AVG(total_work_hours) as avg_work_hours
       FROM attendance 
       WHERE employee_id = ?
@@ -191,12 +194,11 @@ router.put('/:id', async (req, res) => {
     }
 
     await db.query(
-      'UPDATE employees SET name = ?, phone = ?, position = ?, department = ?, whatsapp_id = ?, is_active = ?, updated_at = NOW() WHERE id = ?',
+      'UPDATE employees SET name = ?, phone = ?, position = ?, whatsapp_id = ?, is_active = ?, updated_at = NOW() WHERE id = ?',
       [
         name || existingEmployee[0].name,
         phone || existingEmployee[0].phone,
         position !== undefined ? position : existingEmployee[0].position,
-        department !== undefined ? department : existingEmployee[0].department,
         whatsapp_id !== undefined ? whatsapp_id : existingEmployee[0].whatsapp_id,
         is_active !== undefined ? is_active : existingEmployee[0].is_active,
         id

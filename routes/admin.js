@@ -4,6 +4,46 @@ const db = require('../config/database');
 const moment = require('moment');
 const qrcode = require('qrcode');
 
+// POST /api/admin/init-bot - Initialiser le bot WhatsApp
+router.post('/init-bot', async (req, res) => {
+  try {
+    const whatsappBot = require('../services/whatsappBot');
+    
+    if (whatsappBot.isReady) {
+      return res.json({
+        success: true,
+        message: 'Bot déjà initialisé et connecté',
+        connected: true
+      });
+    }
+
+    if (whatsappBot.client) {
+      return res.json({
+        success: false,
+        message: 'Bot en cours d\'initialisation',
+        connected: false
+      });
+    }
+
+    // Initialiser le bot
+    await whatsappBot.initialize();
+    
+    res.json({
+      success: true,
+      message: 'Bot WhatsApp en cours d\'initialisation...',
+      connected: false
+    });
+
+  } catch (error) {
+    console.error('Erreur lors de l\'initialisation du bot:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Erreur lors de l\'initialisation du bot',
+      details: error.message
+    });
+  }
+});
+
 // GET /api/admin/bot-status - Vérifier le statut du bot
 router.get('/bot-status', async (req, res) => {
   try {
@@ -22,7 +62,8 @@ router.get('/bot-status', async (req, res) => {
         connected: true,
         status: 'Bot connecté et prêt',
         qrCode: null,
-        botNumber: whatsappBot.client?.info?.wid?.user || 'Inconnu'
+        botNumber: whatsappBot.client?.info?.wid?.user || 'Inconnu',
+        message: 'WhatsApp est déjà connecté - Aucun scan de QR code nécessaire'
       });
     }
 

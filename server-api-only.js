@@ -2,12 +2,14 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const jwt = require('jsonwebtoken');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 require('dotenv').config();
 
 const db = require('./config/database');
 const whatsappBot = require('./services/whatsappBot');
+const { authenticateToken } = require('./middleware/auth');
 
 const app = express();
 const server = createServer(app);
@@ -50,20 +52,24 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Routes
-app.use('/api/employees', require('./routes/employees'));
-app.use('/api/attendance', require('./routes/attendance'));
-app.use('/api/permissions', require('./routes/permissions'));
-app.use('/api/reports', require('./routes/reports'));
-app.use('/api/departments', require('./routes/departments'));
-app.use('/api/messages', require('./routes/messages'));
-app.use('/api/ai', require('./routes/ai'));
-app.use('/api/employee-hours', require('./routes/employee-hours'));
+// Route d'authentification (sans protection)
+app.use('/api/auth', require('./routes/auth'));
 
-// Routes admin avec rate limiting spécial
-app.use('/api/admin', statusLimiter, require('./routes/admin'));
+// Routes protégées par authentification
+app.use('/api/employees', authenticateToken, require('./routes/employees'));
+app.use('/api/attendance', authenticateToken, require('./routes/attendance'));
+app.use('/api/permissions', authenticateToken, require('./routes/permissions'));
+app.use('/api/reports', authenticateToken, require('./routes/reports'));
+app.use('/api/departments', authenticateToken, require('./routes/departments'));
+app.use('/api/messages', authenticateToken, require('./routes/messages'));
+app.use('/api/ai', authenticateToken, require('./routes/ai'));
+app.use('/api/employee-hours', authenticateToken, require('./routes/employee-hours'));
 
-// Route pour initialiser le bot WhatsApp
-app.post('/api/admin/init-bot', async (req, res) => {
+// Routes admin avec rate limiting spécial et authentification
+app.use('/api/admin', statusLimiter, authenticateToken, require('./routes/admin'));
+
+// Route pour initialiser le bot WhatsApp (protégée)
+app.post('/api/admin/init-bot', authenticateToken, async (req, res) => {
   try {
     if (whatsappBot.isReady) {
       return res.json({ 
@@ -105,7 +111,7 @@ global.io = io;
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
-    message: 'Bot WhatsApp Entreprise - API en ligne',
+    message: 'Promillys Bot - API en ligne',
     timestamp: new Date().toISOString()
   });
 });
@@ -113,20 +119,21 @@ app.get('/health', (req, res) => {
 // Route racine
 app.get('/', (req, res) => {
   res.json({
-    message: 'Bot WhatsApp Entreprise - API Mode',
+    message: 'Promillys Bot - API Mode',
     version: '1.0.0',
-          endpoints: {
-        health: '/health',
-        employees: '/api/employees',
-        attendance: '/api/attendance',
-        permissions: '/api/permissions',
-        reports: '/api/reports',
-        departments: '/api/departments',
-        messages: '/api/messages',
-        ai: '/api/ai',
-        employeeHours: '/api/employee-hours',
-        admin: '/api/admin'
-      }
+    endpoints: {
+      health: '/health',
+      auth: '/api/auth',
+      employees: '/api/employees',
+      attendance: '/api/attendance',
+      permissions: '/api/permissions',
+      reports: '/api/reports',
+      departments: '/api/departments',
+      messages: '/api/messages',
+      ai: '/api/ai',
+      employeeHours: '/api/employee-hours',
+      admin: '/api/admin'
+    }
   });
 });
 
@@ -166,7 +173,8 @@ async function startServer() {
       console.log(`🚀 Serveur API avec WebSocket démarré sur le port ${PORT}`);
       console.log(`🌐 Interface web: http://localhost:${PORT}`);
       console.log(`🔌 WebSocket disponible pour la synchronisation temps réel`);
-      console.log(`📱 Bot WhatsApp: ${whatsappBot.isReady ? 'Prêt' : 'En attente de connexion'}`);
+      console.log(`🔐 Authentification JWT activée`);
+      console.log(`📱 Promillys Bot: ${whatsappBot.isReady ? 'Prêt' : 'En attente de connexion'}`);
     });
     
   } catch (error) {

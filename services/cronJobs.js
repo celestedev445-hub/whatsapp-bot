@@ -120,6 +120,7 @@ class CronJobs {
           const statusEmoji = {
             'present': '✅',
             'late': '⚠️',
+            'late_justified': '⚠️✅',
             'absent': '❌',
             'permission': '📋'
           };
