@@ -23,8 +23,17 @@ router.get('/', async (req, res) => {
         d.name as department_name
       FROM messages m
       LEFT JOIN employees e ON (
-        e.phone = SUBSTRING(m.from_number, 1, LOCATE('@', m.from_number) - 1) OR
-        e.phone = SUBSTRING(m.from_number, 2, LOCATE('@', m.from_number) - 2)
+        m.employee_id = e.id OR
+        e.phone = REPLACE(SUBSTRING(m.from_number, 1, LOCATE('@', m.from_number) - 1), '+', '') OR
+        e.phone = REPLACE(SUBSTRING(m.from_number, 2, LOCATE('@', m.from_number) - 2), '+', '') OR
+        e.phone = REPLACE(SUBSTRING(m.from_number, 3, LOCATE('@', m.from_number) - 3), '+', '') OR
+        e.phone = REPLACE(m.from_number, '@c.us', '') OR
+        e.phone = REPLACE(m.from_number, '@lid', '') OR
+        e.phone = REPLACE(REPLACE(m.from_number, '@c.us', ''), '+', '') OR
+        e.phone = REPLACE(REPLACE(m.from_number, '@lid', ''), '+', '') OR
+        e.phone = REPLACE(REPLACE(m.from_number, '@lid', ''), '+237', '+237') OR
+        e.phone = REPLACE(REPLACE(m.from_number, '@lid', ''), '153', '237') OR
+        e.phone = REPLACE(REPLACE(m.from_number, '@lid', ''), '153', '237')
       )
       LEFT JOIN departments d ON e.department_id = d.id
       WHERE m.group_id = ?
@@ -72,8 +81,12 @@ router.get('/recent', async (req, res) => {
         d.name as department_name
       FROM messages m
       LEFT JOIN employees e ON (
-        e.phone = SUBSTRING(m.from_number, 1, LOCATE('@', m.from_number) - 1) OR
-        e.phone = SUBSTRING(m.from_number, 2, LOCATE('@', m.from_number) - 2)
+        m.employee_id = e.id OR
+        e.phone = REPLACE(SUBSTRING(m.from_number, 1, LOCATE('@', m.from_number) - 1), '+', '') OR
+        e.phone = REPLACE(SUBSTRING(m.from_number, 2, LOCATE('@', m.from_number) - 2), '+', '') OR
+        e.phone = REPLACE(SUBSTRING(m.from_number, 3, LOCATE('@', m.from_number) - 3), '+', '') OR
+        e.phone = REPLACE(m.from_number, '@c.us', '') OR
+        e.phone = REPLACE(REPLACE(m.from_number, '@c.us', ''), '+', '')
       )
       LEFT JOIN departments d ON e.department_id = d.id
       WHERE m.group_id = ?
@@ -156,8 +169,12 @@ router.post('/send', async (req, res) => {
         d.name as department_name
       FROM messages m
       LEFT JOIN employees e ON (
-        e.phone = SUBSTRING(m.from_number, 1, LOCATE('@', m.from_number) - 1) OR
-        e.phone = SUBSTRING(m.from_number, 2, LOCATE('@', m.from_number) - 2)
+        m.employee_id = e.id OR
+        e.phone = REPLACE(SUBSTRING(m.from_number, 1, LOCATE('@', m.from_number) - 1), '+', '') OR
+        e.phone = REPLACE(SUBSTRING(m.from_number, 2, LOCATE('@', m.from_number) - 2), '+', '') OR
+        e.phone = REPLACE(SUBSTRING(m.from_number, 3, LOCATE('@', m.from_number) - 3), '+', '') OR
+        e.phone = REPLACE(m.from_number, '@c.us', '') OR
+        e.phone = REPLACE(REPLACE(m.from_number, '@c.us', ''), '+', '')
       )
       LEFT JOIN departments d ON e.department_id = d.id
       WHERE m.id = ?

@@ -3,7 +3,6 @@ const qrcode = require('qrcode-terminal');
 const db = require('../config/database');
 const moment = require('moment');
 const aiAgent = require('./aiAgent');
-const smartResponse = require('./smartResponse');
 
 class WhatsAppBot {
   constructor() {
@@ -1820,16 +1819,64 @@ class WhatsAppBot {
 
   async saveMessage(message) {
     try {
-      await db.query(
-        'INSERT INTO messages (message_id, from_number, group_id, content, message_type, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-        [message.id._serialized, message.from, this.groupId, message.body, 'text', new Date()]
+      // Pour les messages de groupe, utiliser message.author (numéro de l'expéditeur)
+      // Pour les messages privés, utiliser message.from
+      const fromNumber = message.author || message.from;
+      
+      // Récupérer le contact pour obtenir le nom réel
+      let contactName = null;
+      let employeeId = null;
+      
+      if (fromNumber && (fromNumber.includes('@c.us') || fromNumber.includes('@lid'))) {
+        try {
+          // Récupérer le contact WhatsApp pour obtenir le nom
+          const contact = await this.client.getContactById(fromNumber);
+          contactName = contact.name || contact.pushname || contact.number || null;
+          
+          console.log(`👤 Contact trouvé: ${contactName} (${fromNumber})`);
+          
+          const cleanPhone = fromNumber.replace(/^\+/, '').replace(/@(c\.us|lid)$/, '');
+          
+          // Chercher l'employé existant
+          let employeeResult = await db.query(
+            'SELECT id FROM employees WHERE phone = ? OR whatsapp_id = ? AND is_active = 1',
+            [cleanPhone, fromNumber]
+          );
+          
+          if (employeeResult.length > 0) {
+            employeeId = employeeResult[0].id;
+            // Mettre à jour le nom si nécessaire
+            if (contactName) {
+              await db.query(
+                'UPDATE employees SET name = ? WHERE id = ?',
+                [contactName, employeeId]
+              );
+              console.log(`✅ Nom mis à jour: ${contactName}`);
+            }
+          } else {
+            // Si l'employé n'existe pas, l'ajouter avec le vrai nom
+            console.log(`➕ Ajout automatique de l'employé: ${contactName || cleanPhone} (${fromNumber})`);
+            const insertResult = await db.query(
+              'INSERT INTO employees (name, phone, whatsapp_id, is_active, created_at) VALUES (?, ?, ?, 1, NOW())',
+              [contactName || cleanPhone, cleanPhone, fromNumber]
+            );
+            employeeId = insertResult.insertId;
+            console.log(`✅ Employé ajouté avec l'ID: ${employeeId}`);
+          }
+        } catch (error) {
+          console.log('Erreur lors de la recherche/ajout de l\'employé:', error.message);
+        }
+      }
+            await db.query(
+        'INSERT INTO messages (message_id, from_number, group_id, content, message_type, employee_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [message.id._serialized, fromNumber, this.groupId, message.body, 'text', employeeId, new Date()]
       );
       
       // Émettre un événement WebSocket pour notifier les clients
       if (global.io) {
         global.io.emit('new_message', {
           message_id: message.id._serialized,
-          from_number: message.from,
+          from_number: fromNumber,
           content: message.body,
           message_type: 'text',
           timestamp: new Date()
